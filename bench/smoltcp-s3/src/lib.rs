@@ -101,17 +101,22 @@ extern "C" {
 /// in exactly one write. `write_fmt` calls `write_str` once per format
 /// fragment, so writing directly let concurrent workers interleave *within* a
 /// line, producing output like "q2: 2048 of 16384 ... using q245".
-struct LineBuf {
-    buf: [u8; LINE_MAX],
+struct BufWriter<'a> {
+    buf: &'a mut [u8],
     used: usize,
 }
 
 const LINE_MAX: usize = 256;
 
-impl Write for LineBuf {
+impl<'a> BufWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, used: 0 }
+    }
+}
+
+impl Write for BufWriter<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let space = self.buf.len() - self.used;
-        let n = core::cmp::min(s.len(), space);
+        let n = core::cmp::min(s.len(), self.buf.len() - self.used);
         self.buf[self.used..self.used + n].copy_from_slice(&s.as_bytes()[..n]);
         self.used += n;
         Ok(()) // silently truncate rather than fail a diagnostic print
@@ -124,13 +129,17 @@ impl Write for LineBuf {
 static PRINT_LOCK: AtomicBool = AtomicBool::new(false);
 
 fn print_line(args: fmt::Arguments) {
-    let mut line = LineBuf { buf: [0; LINE_MAX], used: 0 };
-    let _ = line.write_fmt(args);
-    if line.used == line.buf.len() {
-        line.used -= 1; // make room for the newline on a truncated line
+    let mut buf = [0u8; LINE_MAX];
+    let mut used = {
+        let mut w = BufWriter::new(&mut buf);
+        let _ = w.write_fmt(args);
+        w.used
+    };
+    if used == LINE_MAX {
+        used -= 1; // make room for the newline on a truncated line
     }
-    line.buf[line.used] = b'\n';
-    line.used += 1;
+    buf[used] = b'\n';
+    used += 1;
 
     while PRINT_LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -139,8 +148,8 @@ fn print_line(args: fmt::Arguments) {
         core::hint::spin_loop();
     }
     let mut off = 0;
-    while off < line.used {
-        let n = unsafe { write(1, line.buf[off..].as_ptr(), line.used - off) };
+    while off < used {
+        let n = unsafe { write(1, buf[off..].as_ptr(), used - off) };
         if n <= 0 {
             break;
         }
@@ -203,13 +212,6 @@ extern "C" {
     fn shim_mbuf_free(handle: *mut c_void);
     fn shim_rss_hash_key(port_id: u16, out_key: *mut u8, out_len: u16) -> c_int;
     fn shim_rss_reta(port_id: u16, out: *mut u16, out_entries: u16) -> c_int;
-    fn shim_mbuf_rx_burst(
-        port_id: u16,
-        queue_id: u16,
-        out_handle: *mut *mut c_void,
-        out_data: *mut *const u8,
-        out_len: *mut u16,
-    ) -> c_int;
     fn shim_mbuf_rx_burst_n(
         port_id: u16,
         queue_id: u16,
@@ -250,7 +252,7 @@ fn probe_and_open(n_queues: u16) -> Option<(Vec<PktPool>, [u8; 6])> {
     let mut pools: Vec<PktPool> = Vec::with_capacity(n_queues as usize);
     for q in 0..n_queues {
         let mut name = [0u8; 32];
-        let _ = write!(&mut PoolName(&mut name), "bench-pool-{}\0", q);
+        let _ = write!(&mut BufWriter::new(&mut name), "bench-pool-{}\0", q);
         let raw = unsafe {
             shim_pktmbuf_pool_create(name.as_ptr(), per_queue_size, CACHE, 0, DATA_ROOM_SIZE)
         };
@@ -283,18 +285,6 @@ fn probe_and_open(n_queues: u16) -> Option<(Vec<PktPool>, [u8; 6])> {
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], n_queues
     );
     Some((pools, mac))
-}
-
-// Tiny helper: format a null-terminated pool name into a fixed buffer
-// without pulling in `alloc::format!`.
-struct PoolName<'a>(&'a mut [u8]);
-impl core::fmt::Write for PoolName<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let n = core::cmp::min(s.len(), self.0.len());
-        self.0[..n].copy_from_slice(&s.as_bytes()[..n]);
-        self.0 = &mut core::mem::take(&mut self.0)[n..];
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +740,15 @@ fn parse_arp_reply_from(frame: &[u8], expected_ip: [u8; 4]) -> Option<[u8; 6]> {
 const TARGET_IP_OCTETS: [u8; 4] = parse_ipv4(option_env!("AWS_TARGET_IP"));
 const TARGET_IP: Ipv4Address = Ipv4Address::new(
     TARGET_IP_OCTETS[0], TARGET_IP_OCTETS[1], TARGET_IP_OCTETS[2], TARGET_IP_OCTETS[3]);
+
+// Catch a missing or malformed address at build time. The runtime guard below
+// still exists for safety, but discovering this on a booted instance costs a
+// VM launch to learn something the compiler already knew.
+const _: () = assert!(
+    !(TARGET_IP_OCTETS[0] == 0 && TARGET_IP_OCTETS[1] == 0
+      && TARGET_IP_OCTETS[2] == 0 && TARGET_IP_OCTETS[3] == 0),
+    "AWS_TARGET_IP is unset or malformed - run `just setup smoltcp-s3`"
+);
 const TARGET_PORT: u16 = 443;
 // Endpoint is baked in at build time from $AWS_BUCKET / $AWS_REGION
 // (see `just setup`).
@@ -763,16 +762,7 @@ const TARGET_SNI: &str = TARGET_HOST;
 const TARGET_PATH: &[u8] = b"/blob.bin";
 
 fn build_range_request(buf: &mut [u8], start: u64, end_inclusive: u64) -> usize {
-    struct Wr<'a> { buf: &'a mut [u8], used: usize }
-    impl core::fmt::Write for Wr<'_> {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let n = core::cmp::min(s.len(), self.buf.len() - self.used);
-            self.buf[self.used..self.used + n].copy_from_slice(&s.as_bytes()[..n]);
-            self.used += n;
-            Ok(())
-        }
-    }
-    let mut w = Wr { buf, used: 0 };
+    let mut w = BufWriter::new(buf);
     let _ = write!(
         &mut w,
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: minidpdk-smoltcp/0.1\r\nRange: bytes={}-{}\r\nConnection: close\r\n\r\n",
@@ -1307,14 +1297,17 @@ fn learn_network(
 
     let mut iter: u64 = 0;
     loop {
-        let mut handle: *mut c_void = ptr::null_mut();
-        let mut data: *const u8 = ptr::null();
-        let mut len: u16 = 0;
-        let rc = unsafe { shim_mbuf_rx_burst(0, 0, &mut handle, &mut data, &mut len) };
-        if rc == 1 && !handle.is_null() {
-            let slice = unsafe { core::slice::from_raw_parts(data, len as usize) };
+        let mut handle = [ptr::null_mut::<c_void>(); 1];
+        let mut data = [ptr::null::<u8>(); 1];
+        let mut len = [0u16; 1];
+        let got = unsafe {
+            shim_mbuf_rx_burst_n(0, 0, handle.as_mut_ptr(), data.as_mut_ptr(),
+                                 len.as_mut_ptr(), 1)
+        };
+        if got == 1 {
+            let slice = unsafe { core::slice::from_raw_parts(data[0], len[0] as usize) };
             let hw = parse_arp_reply_from(slice, gw.octets());
-            unsafe { shim_mbuf_free(handle) };
+            unsafe { shim_mbuf_free(handle[0]) };
             if let Some(hw) = hw {
                 println!("gateway MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                     hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]);

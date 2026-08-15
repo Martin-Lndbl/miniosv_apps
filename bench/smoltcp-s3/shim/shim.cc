@@ -279,29 +279,6 @@ int shim_rss_reta(uint16_t port_id, uint16_t *out, uint16_t out_entries) {
   return n;
 }
 
-int shim_mbuf_rx_burst(uint16_t port_id, uint16_t queue_id, void **out_handle,
-                        const uint8_t **out_data, uint16_t *out_len) {
-  rte_mbuf *m = nullptr;
-  if (rte_eth_rx_burst(port_id, queue_id, &m, 1) == 0 || m == nullptr) {
-    return 0;
-  }
-  // Drop packets the NIC flagged as bad — smoltcp is configured with
-  // ChecksumCapabilities::ignored, so we can't rely on it to catch them.
-  const uint64_t ol = m->ol_flags;
-  const bool ip_bad =
-      (ol & RTE_MBUF_F_RX_IP_CKSUM_MASK) == RTE_MBUF_F_RX_IP_CKSUM_BAD;
-  const bool l4_bad =
-      (ol & RTE_MBUF_F_RX_L4_CKSUM_MASK) == RTE_MBUF_F_RX_L4_CKSUM_BAD;
-  if (ip_bad || l4_bad) {
-    rte_pktmbuf_free(m);
-    return 0;
-  }
-  *out_handle = m;
-  *out_data = rte_pktmbuf_mtod(m, const uint8_t *);
-  *out_len = m->data_len;
-  return 1;
-}
-
 // Batched RX: pulls up to `max` mbufs from the NIC in one call.
 // The three output arrays are parallel; entries [0..returned) are
 // filled with (mbuf handle, data pointer, data length). Bad-cksum
