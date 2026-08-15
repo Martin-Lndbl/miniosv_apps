@@ -245,7 +245,11 @@ impl Drop for PktPool {
 fn probe_and_open(n_queues: u16) -> Option<(Vec<PktPool>, [u8; 6])> {
     const PORT: u16 = 0;
     const DATA_ROOM_SIZE: u16 = 1536;
-    const DESC_NUM: u16 = 1024;
+    // 1024 descriptors could not absorb the inbound burst while a worker
+    // walked 48 connection state machines between polls: the NIC dropped 3.3%
+    // of all inbound frames for want of a free descriptor (imissed), which is
+    // invisible above the driver and looked like unanswered SYNs.
+    const DESC_NUM: u16 = 4096;
     const CACHE: u32 = 64;
     // Size for every simultaneous holder rather than the RX ring plus a
     // guess: the RX ring pins DESC_NUM-1, the TX ring holds up to DESC_NUM
@@ -274,6 +278,14 @@ fn probe_and_open(n_queues: u16) -> Option<(Vec<PktPool>, [u8; 6])> {
     }
     let (mut rx_desc, mut tx_desc) = (DESC_NUM, DESC_NUM);
     unsafe { shim_adjust_nb_rx_tx_desc(PORT, &mut rx_desc, &mut tx_desc) };
+    // The device clamps to what it supports, so report what was actually
+    // granted rather than what was asked for.
+    if rx_desc != DESC_NUM || tx_desc != DESC_NUM {
+        println!("descriptors: asked {}, got rx {} tx {} (device clamp)",
+            DESC_NUM, rx_desc, tx_desc);
+    } else {
+        println!("descriptors: rx {} tx {} per queue", rx_desc, tx_desc);
+    }
     for q in 0..n_queues {
         if unsafe { shim_rx_queue_setup(PORT, q, rx_desc, pools[q as usize].0) } != 0 {
             return None;
