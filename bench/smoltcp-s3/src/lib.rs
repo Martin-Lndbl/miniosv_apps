@@ -369,9 +369,14 @@ const N_WORKERS_REQ: u16 = parse_size(option_env!("BENCH_WORKERS"), 8) as u16;
 /// Parallel TLS connections each worker drives.
 const CONNS_PER_WORKER: usize =
     parse_size(option_env!("BENCH_CONNS_PER_WORKER"), 24) as usize;
-/// Size of the object being fetched — must match what is actually in the
-/// bucket, or the Range requests run off the end of it.
-const FILE_SIZE: u64 = parse_size(option_env!("AWS_BUCKET_SIZE"), 10 * 1024 * 1024 * 1024);
+/// Size of the object in the bucket. Bounds the offsets a Range may name; it
+/// is no longer the amount transferred.
+const OBJECT_SIZE: u64 = parse_size(option_env!("AWS_BUCKET_SIZE"), 10 * 1024 * 1024 * 1024);
+/// Bytes each connection requests. Held fixed while worker count varies, so
+/// that a throughput-vs-parallelism curve is not also a
+/// throughput-vs-request-size curve: splitting a fixed total across workers
+/// shrank each request as parallelism rose and confounded the two.
+const BLOCK_SIZE: u64 = parse_size(option_env!("BENCH_BLOCK_SIZE"), 64 * 1024 * 1024);
 /// Discard ciphertext after the handshake instead of decrypting it. Isolates
 /// the network stack from the record layer; the transfer is then unverifiable
 /// byte-for-byte, so the completeness check falls back to a range check.
@@ -1064,8 +1069,8 @@ struct WorkerCtx {
     prefix_len: u8,
     gateway_ip: [u8; 4],
     gateway_mac: [u8; 6],
-    range_start: u64,
-    range_end_inclusive: u64,
+    /// Index of this worker's first block in the global block sequence.
+    first_block: u64,
     bytes_received: AtomicU64,
     elapsed_ns: AtomicU64,
     // Completeness accounting: what this worker's connections were asked to
@@ -1138,7 +1143,7 @@ extern "C" fn worker_thread(arg: *mut c_void) {
     // Split the worker's byte range across the connections it can actually
     // open. Computed after port selection so a worker short of usable ports
     // still covers its whole range rather than silently dropping the tail.
-    let span = ctx.range_end_inclusive - ctx.range_start + 1;
+
 
     // Collect this worker's owned ports, spread across the range rather than
     // taken consecutively — adjacent ports are no more likely to collide, but
@@ -1165,19 +1170,19 @@ extern "C" fn worker_thread(arg: *mut c_void) {
         ctx.queue_id, owned_count, EPH_LEN, my_ports.len());
 
     let n_conns = core::cmp::min(CONNS_PER_WORKER, my_ports.len());
-    let per_conn = span / core::cmp::max(1, n_conns as u64);
 
     let mut conns: Vec<Conn> = Vec::with_capacity(n_conns);
     // Ranges are split across all n_conns, but fault injection skips creating
     // the last few — leaving their byte ranges genuinely unrequested, which is
     // exactly the failure the completeness check has to catch.
     for i in 0..n_conns.saturating_sub(FAULT_ABANDON_CONNS) {
-        let start = ctx.range_start + (i as u64) * per_conn;
-        let end = if i == n_conns - 1 {
-            ctx.range_end_inclusive
-        } else {
-            start + per_conn - 1
-        };
+        // Every connection fetches one fixed-size block. Blocks are laid out
+        // consecutively and wrap within the object, so distinct connections
+        // read distinct offsets rather than replaying one hot range.
+        let block = ctx.first_block + i as u64;
+        let stride = OBJECT_SIZE.saturating_sub(BLOCK_SIZE) + 1;
+        let start = if stride == 0 { 0 } else { block.wrapping_mul(BLOCK_SIZE) % stride };
+        let end = start + BLOCK_SIZE - 1;
         // Chosen so the return flow provably hashes to this worker's queue.
         let src_port = my_ports[i];
         {
@@ -1330,16 +1335,16 @@ fn learn_network(
 pub extern "C" fn osv_app_main() {
 
     let t = TARGET_IP.octets();
-    println!("bench: {} workers x {} conns, {} MiB object, tls_stub={}",
-        N_WORKERS_REQ, CONNS_PER_WORKER, FILE_SIZE / (1024 * 1024),
+    println!("bench: {} workers x {} conns x {} MiB block, tls_stub={}",
+        N_WORKERS_REQ, CONNS_PER_WORKER, BLOCK_SIZE / (1024 * 1024),
         STUB_TLS_AFTER_HANDSHAKE);
     println!("target: {}.{}.{}.{}:{} {}", t[0], t[1], t[2], t[3], TARGET_PORT, TARGET_HOST);
     if t == [0, 0, 0, 0] {
         println!("FAIL: AWS_TARGET_IP is unset or malformed — run `just setup smoltcp-s3`");
         loop { core::hint::spin_loop(); }
     }
-    if FILE_SIZE == 0 || CONNS_PER_WORKER == 0 || N_WORKERS_REQ == 0 {
-        println!("FAIL: BENCH_WORKERS, BENCH_CONNS_PER_WORKER and AWS_BUCKET_SIZE must be nonzero");
+    if OBJECT_SIZE == 0 || BLOCK_SIZE == 0 || CONNS_PER_WORKER == 0 || N_WORKERS_REQ == 0 {
+        println!("FAIL: BENCH_WORKERS, BENCH_CONNS_PER_WORKER, BENCH_BLOCK_SIZE and AWS_BUCKET_SIZE must be nonzero");
         loop { core::hint::spin_loop(); }
     }
 
@@ -1374,13 +1379,11 @@ pub extern "C" fn osv_app_main() {
 
     N_WORKERS.store(n_workers, Ordering::Relaxed);
 
-    // Split the file across n_workers via HTTP Range so total bytes =
-    // FILE_SIZE (not n_workers * FILE_SIZE).
-    let chunk = FILE_SIZE / n_workers;
+    // No file split: every connection fetches one BLOCK_SIZE block, so the
+    // bytes moved scale with worker count instead of being divided by it.
     let mut ctxs: Vec<Box<WorkerCtx>> = Vec::new();
     for i in 0..n_workers {
-        let start = i * chunk;
-        let end_inclusive = if i == n_workers - 1 { FILE_SIZE - 1 } else { start + chunk - 1 };
+
         // No port slabs: each worker derives its own ports from the RSS
         // hash, and the hash partitions the range disjointly by construction.
         let ctx = Box::new(WorkerCtx {
@@ -1391,8 +1394,7 @@ pub extern "C" fn osv_app_main() {
             prefix_len,
             gateway_ip: gw_bytes,
             gateway_mac: gw_mac.0,
-            range_start: start,
-            range_end_inclusive: end_inclusive,
+            first_block: i * (CONNS_PER_WORKER as u64),
             bytes_received: AtomicU64::new(0),
             elapsed_ns: AtomicU64::new(0),
             bytes_expected: AtomicU64::new(0),
@@ -1435,7 +1437,8 @@ pub extern "C" fn osv_app_main() {
     // every range was actually requested (a connection that never opened
     // abandons its range silently), and enough bytes arrived to cover them.
     let ranges_ok = conns_clean == conns_total && conns_total > 0;
-    let covered = total_expected == FILE_SIZE;
+    let planned_conns = n_workers * (CONNS_PER_WORKER as u64);
+    let covered = conns_total == planned_conns;
     let misrouted = MISROUTED_DROPS.load(Ordering::Relaxed);
     let retries = SYN_RETRIES.load(Ordering::Relaxed);
     let failed = CONNS_FAILED.load(Ordering::Relaxed);
@@ -1447,7 +1450,8 @@ pub extern "C" fn osv_app_main() {
     println!("misrouted rx  : {} packets dropped (expected 0)", misrouted);
     println!("setup         : {} ms total, {:.1} ms/conn",
         setup_ms, setup_ms as f64 / (conns_total.max(1)) as f64);
-    println!("ranges        : {} of {} bytes requested", total_expected, FILE_SIZE);
+    println!("blocks        : {}/{} of {} MiB requested ({} bytes)",
+        conns_total, planned_conns, BLOCK_SIZE / (1024 * 1024), total_expected);
 
     if STUB_TLS_AFTER_HANDSHAKE {
         // Ciphertext, so it carries TLS record and HTTP header overhead and
@@ -1467,15 +1471,15 @@ pub extern "C" fn osv_app_main() {
 
     if ranges_ok && covered && bytes_ok && misrouted == 0 {
         if STUB_TLS_AFTER_HANDSHAKE {
-            println!("COMPLETE: all {} ranges fetched (set BENCH_TLS_STUB=0 for a byte-exact check)",
+            println!("COMPLETE: all {} blocks fetched (set BENCH_TLS_STUB=0 for a byte-exact check)",
                 conns_total);
         } else {
             println!("COMPLETE: {} bytes, byte-exact", total_b);
         }
     } else {
-        println!("INCOMPLETE: {} connections abandoned, {} bytes unrequested, {} bytes {}",
+        println!("INCOMPLETE: {} connections abandoned, {} blocks unrequested, {} bytes {}",
             conns_total - conns_clean,
-            FILE_SIZE.saturating_sub(total_expected),
+            planned_conns.saturating_sub(conns_total),
             if total_b > total_expected { total_b - total_expected } else { total_expected - total_b },
             if total_b > total_expected { "over" } else { "short" });
     }

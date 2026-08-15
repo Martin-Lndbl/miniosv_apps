@@ -10,6 +10,7 @@ fn main() {
         "BENCH_WORKERS",
         "BENCH_CONNS_PER_WORKER",
         "BENCH_TLS_STUB",
+        "BENCH_BLOCK_SIZE",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }

@@ -54,6 +54,9 @@ setup:
     workers=$(ask "worker threads / rss queues" "${BENCH_WORKERS:-8}")
     conns=$(ask "connections per worker" "${BENCH_CONNS_PER_WORKER:-24}")
     tls_stub=$(ask "discard ciphertext instead of decrypting (0/1)" "${BENCH_TLS_STUB:-0}")
+    # Held fixed while workers vary: bytes moved = workers x conns x block, so
+    # a throughput-vs-parallelism curve is not also a request-size curve.
+    block=$(ask "bytes per request (block size)" "${BENCH_BLOCK_SIZE:-64M}")
 
     if [ "$bucket" = "create" ] || [ -z "$bucket" ]; then
         bucket="miniosv-bench-$(date +%s)"
@@ -144,6 +147,7 @@ setup:
         printf 'BENCH_WORKERS="%s"\n' "$workers"
         printf 'BENCH_CONNS_PER_WORKER="%s"\n' "$conns"
         printf 'BENCH_TLS_STUB="%s"\n' "$tls_stub"
+        printf 'BENCH_BLOCK_SIZE="%s"\n' "$block"
     } > "$env_file"
 
     echo "wrote $env_file — reload the devshell to pick it up (direnv does it for you)"
@@ -196,3 +200,4 @@ clean *force:
         rm -f "$env_file"
         echo "removed $env_file"
     fi
+
