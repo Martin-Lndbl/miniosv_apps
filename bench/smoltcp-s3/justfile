@@ -51,7 +51,7 @@ setup:
     # Bench shape. Workers are clamped at run time to the RSS queue count the
     # NIC advertises, which is where the useful parallelism ceiling actually
     # comes from (c7i.8xlarge caps at 8, for instance).
-    workers=$(ask "worker threads / rss queues" "${BENCH_WORKERS:-32}")
+    workers=$(ask "worker threads / rss queues" "${BENCH_WORKERS:-8}")
     conns=$(ask "connections per worker" "${BENCH_CONNS_PER_WORKER:-24}")
     tls_stub=$(ask "discard ciphertext instead of decrypting (0/1)" "${BENCH_TLS_STUB:-0}")
 

@@ -343,7 +343,7 @@ const fn parse_ipv4(s: Option<&str>) -> [u8; 4] {
 }
 
 /// RSS queues (and worker threads) to ask for; clamped to the device maximum.
-const N_WORKERS_REQ: u16 = parse_size(option_env!("BENCH_WORKERS"), 32) as u16;
+const N_WORKERS_REQ: u16 = parse_size(option_env!("BENCH_WORKERS"), 8) as u16;
 /// Parallel TLS connections each worker drives.
 const CONNS_PER_WORKER: usize =
     parse_size(option_env!("BENCH_CONNS_PER_WORKER"), 24) as usize;
