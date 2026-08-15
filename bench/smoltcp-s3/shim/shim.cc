@@ -218,6 +218,44 @@ uint32_t shim_mbuf_rss_hash(void *handle) {
 // What the device actually accepted, after masking against rx_offload_capa.
 uint64_t shim_rx_offloads(void) { return g_rx_offloads; }
 
+// NIC-side counters. The only place a frame the hardware dropped before any
+// queue saw it shows up — an unanswered SYN and a SYN-ACK the NIC discarded
+// are indistinguishable from inside the stack without these.
+// out: [ipackets, opackets, ibytes, obytes, imissed, ierrors, oerrors, rx_nombuf]
+int shim_eth_stats(uint16_t port_id, uint64_t *out, uint16_t n) {
+  rte_eth_dev *dev = lookup_dev(port_id);
+  if (dev == nullptr || out == nullptr || n < 8) return -1;
+  rte_eth_stats st;
+  std::memset(&st, 0, sizeof(st));
+  dev->get_stats(&st);
+  out[0] = st.ipackets.load();
+  out[1] = st.opackets.load();
+  out[2] = st.ibytes.load();
+  out[3] = st.obytes.load();
+  out[4] = st.imissed.load();
+  out[5] = st.ierrors.load();
+  out[6] = st.oerrors.load();
+  out[7] = st.rx_nombuf.load();
+  return 0;
+}
+
+// Per-queue receive counters, so a drop can be attributed to the queue whose
+// connection failed rather than only to the port as a whole.
+int shim_eth_qstats(uint16_t port_id, uint64_t *ipkts, uint64_t *errs,
+                    uint16_t nq) {
+  rte_eth_dev *dev = lookup_dev(port_id);
+  if (dev == nullptr || ipkts == nullptr || errs == nullptr) return -1;
+  rte_eth_stats st;
+  std::memset(&st, 0, sizeof(st));
+  dev->get_stats(&st);
+  uint16_t n = nq < RTE_ETHDEV_QUEUE_STAT_CNTRS ? nq : RTE_ETHDEV_QUEUE_STAT_CNTRS;
+  for (uint16_t i = 0; i < n; i++) {
+    ipkts[i] = st.q_ipackets[i];
+    errs[i] = st.q_errors[i];
+  }
+  return n;
+}
+
 // --- RSS introspection -----------------------------------------------------
 // The key the NIC is hashing with, and the indirection table it steers by.
 // Both are read from the device/driver rather than assumed, so the port ->

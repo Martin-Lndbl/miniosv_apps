@@ -54,6 +54,13 @@ void shim_mbuf_free(void *handle);
 uint32_t shim_mbuf_rss_hash(void *handle);
 uint64_t shim_rx_offloads(void);
 
+// NIC counters: [ipackets, opackets, ibytes, obytes, imissed, ierrors,
+// oerrors, rx_nombuf]. `imissed` is frames the device dropped for want of a
+// descriptor — invisible to the stack above.
+int shim_eth_stats(uint16_t port_id, uint64_t *out, uint16_t n);
+int shim_eth_qstats(uint16_t port_id, uint64_t *ipkts, uint64_t *errs,
+                    uint16_t nq);
+
 // RSS introspection. `shim_rss_hash_key` writes the device's current
 // Toeplitz key into out_key and returns its length in bytes (negative on
 // failure). `shim_rss_reta` writes one queue id per indirection-table entry

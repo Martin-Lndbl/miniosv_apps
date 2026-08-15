@@ -212,6 +212,8 @@ extern "C" {
     fn shim_mbuf_free(handle: *mut c_void);
     fn shim_rss_hash_key(port_id: u16, out_key: *mut u8, out_len: u16) -> c_int;
     fn shim_rss_reta(port_id: u16, out: *mut u16, out_entries: u16) -> c_int;
+    fn shim_eth_stats(port_id: u16, out: *mut u64, n: u16) -> c_int;
+    fn shim_eth_qstats(port_id: u16, ipkts: *mut u64, errs: *mut u64, nq: u16) -> c_int;
     fn shim_mbuf_rx_burst_n(
         port_id: u16,
         queue_id: u16,
@@ -1476,6 +1478,29 @@ pub extern "C" fn osv_app_main() {
     println!("misrouted rx  : {} packets dropped (expected 0)", misrouted);
     println!("tx drops      : {} no-mbuf, {} ring-full (expected 0)",
         TX_ALLOC_FAIL.load(Ordering::Relaxed), TX_BURST_FAIL.load(Ordering::Relaxed));
+
+    // NIC counters. `imissed` is the one that matters for an unanswered SYN:
+    // a SYN-ACK the device dropped for want of a descriptor never reaches any
+    // queue, so from inside the stack it is indistinguishable from a peer that
+    // never replied. Without this the cause cannot be attributed at all.
+    let mut st = [0u64; 8];
+    if unsafe { shim_eth_stats(0, st.as_mut_ptr(), st.len() as u16) } == 0 {
+        println!("nic rx        : {} pkts, {} imissed, {} ierrors, {} nombuf",
+            st[0], st[4], st[5], st[7]);
+        println!("nic tx        : {} pkts, {} oerrors", st[1], st[6]);
+        if st[4] > 0 || st[7] > 0 {
+            println!("  ^ the NIC dropped frames before any queue saw them");
+        }
+    }
+    let (mut qi, mut qe) = ([0u64; 32], [0u64; 32]);
+    let nq = unsafe { shim_eth_qstats(0, qi.as_mut_ptr(), qe.as_mut_ptr(), n as u16) };
+    if nq > 0 {
+        for q in 0..(nq as usize).min(n as usize) {
+            if qe[q] > 0 {
+                println!("  q{}: {} rx pkts, {} errors", q, qi[q], qe[q]);
+            }
+        }
+    }
     println!("setup         : {} ms total, {:.1} ms/conn",
         setup_ms, setup_ms as f64 / (conns_total.max(1)) as f64);
     println!("blocks        : {}/{} of {} MiB requested ({} bytes)",
