@@ -169,6 +169,8 @@ extern "C" {
     ) -> *mut u8;
     fn shim_mbuf_tx(port_id: u16, queue_id: u16, handle: *mut c_void, len: u16) -> c_int;
     fn shim_mbuf_free(handle: *mut c_void);
+    fn shim_rss_hash_key(port_id: u16, out_key: *mut u8, out_len: u16) -> c_int;
+    fn shim_rss_reta(port_id: u16, out: *mut u16, out_entries: u16) -> c_int;
     fn shim_mbuf_rx_burst(
         port_id: u16,
         queue_id: u16,
@@ -264,6 +266,243 @@ impl core::fmt::Write for PoolName<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// Compile-time configuration, baked in from the environment by `just setup`.
+// Defaults are the values the benchmark was tuned with, so an unset variable
+// still gives a sensible run.
+// ---------------------------------------------------------------------------
+
+/// Decimal integer, optionally with an IEC suffix (K/M/G/T, `i` and `B`
+/// ignored) so `AWS_BUCKET_SIZE="10G"` parses directly.
+const fn parse_size(s: Option<&str>, default: u64) -> u64 {
+    let s = match s { Some(s) => s, None => return default };
+    let b = s.as_bytes();
+    if b.is_empty() { return default; }
+    let mut i = 0;
+    let mut v: u64 = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c >= b'0' && c <= b'9' {
+            v = v * 10 + (c - b'0') as u64;
+            i += 1;
+        } else {
+            let mult: u64 = match c {
+                b'K' | b'k' => 1024,
+                b'M' | b'm' => 1024 * 1024,
+                b'G' | b'g' => 1024 * 1024 * 1024,
+                b'T' | b't' => 1024u64 * 1024 * 1024 * 1024,
+                b'B' | b'b' | b'i' | b'I' => 1,
+                _ => return default,
+            };
+            return v * mult;
+        }
+    }
+    v
+}
+
+const fn parse_bool(s: Option<&str>, default: bool) -> bool {
+    let s = match s { Some(s) => s, None => return default };
+    let b = s.as_bytes();
+    if b.is_empty() { return default; }
+    match b[0] {
+        b'1' | b't' | b'T' | b'y' | b'Y' => true,
+        b'0' | b'f' | b'F' | b'n' | b'N' => false,
+        _ => default,
+    }
+}
+
+/// Dotted-quad, e.g. "3.5.216.240". Falls back to 0.0.0.0, which the caller
+/// treats as "not configured" and reports rather than silently misdialling.
+const fn parse_ipv4(s: Option<&str>) -> [u8; 4] {
+    let s = match s { Some(s) => s, None => return [0; 4] };
+    let b = s.as_bytes();
+    let mut out = [0u8; 4];
+    let mut oct = 0;
+    let mut acc: u32 = 0;
+    let mut seen = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c >= b'0' && c <= b'9' {
+            acc = acc * 10 + (c - b'0') as u32;
+            if acc > 255 { return [0; 4]; }
+            seen = true;
+        } else if c == b'.' {
+            if !seen || oct >= 3 { return [0; 4]; }
+            out[oct] = acc as u8;
+            oct += 1;
+            acc = 0;
+            seen = false;
+        } else {
+            return [0; 4];
+        }
+        i += 1;
+    }
+    if !seen || oct != 3 { return [0; 4]; }
+    out[3] = acc as u8;
+    out
+}
+
+/// RSS queues (and worker threads) to ask for; clamped to the device maximum.
+const N_WORKERS_REQ: u16 = parse_size(option_env!("BENCH_WORKERS"), 32) as u16;
+/// Parallel TLS connections each worker drives.
+const CONNS_PER_WORKER: usize =
+    parse_size(option_env!("BENCH_CONNS_PER_WORKER"), 24) as usize;
+/// Size of the object being fetched — must match what is actually in the
+/// bucket, or the Range requests run off the end of it.
+const FILE_SIZE: u64 = parse_size(option_env!("AWS_BUCKET_SIZE"), 10 * 1024 * 1024 * 1024);
+/// Discard ciphertext after the handshake instead of decrypting it. Isolates
+/// the network stack from the record layer; the transfer is then unverifiable
+/// byte-for-byte, so the completeness check falls back to a range check.
+const STUB_TLS_AFTER_HANDSHAKE: bool = parse_bool(option_env!("BENCH_TLS_STUB"), false);
+
+// ---------------------------------------------------------------------------
+// Counters. These are cheap and stay in the build: each one is an invariant
+// that should hold on every run, so a regression shows up in the output
+// rather than as a mysteriously slower number.
+// ---------------------------------------------------------------------------
+
+/// Packets discarded because they arrived on a queue that does not own the
+/// destination port. Source ports are chosen so this cannot happen; a nonzero
+/// value means the RSS model no longer matches the hardware.
+static MISROUTED_DROPS: AtomicU64 = AtomicU64::new(0);
+static CONNS_ESTABLISHED: AtomicU64 = AtomicU64::new(0);
+static CONNS_FAILED: AtomicU64 = AtomicU64::new(0);
+/// Extra SYNs beyond the first. Should be 0.
+static SYN_RETRIES: AtomicU64 = AtomicU64::new(0);
+static SETUP_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+static N_WORKERS: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// RSS steering model.
+//
+// The RX queue a flow lands on is a pure function of its 4-tuple:
+//
+//     queue = reta[ toeplitz(key, src_ip||dst_ip||sport||dport) & (len-1) ]
+//
+// The key and table are read from the device at startup rather than assumed.
+// This exact form was validated against 200k live packets (100% agreement,
+// against 48-50% for every other key orientation and tuple order tried), and
+// the Toeplitz implementation against the canonical Microsoft RSS vectors.
+//
+// Because we control our own source port, we can invert it: pick ports whose
+// return traffic provably lands on the queue we are polling.
+// ---------------------------------------------------------------------------
+
+const EPH_BASE: u16 = 49152;
+const EPH_LEN: usize = 16384;
+const OWNED_BITMAP_BYTES: usize = EPH_LEN / 8;
+
+static mut RSS_KEY: [u8; 64] = [0; 64];
+static mut RSS_KEY_LEN: usize = 0;
+static mut RSS_RETA: [u16; 512] = [0; 512];
+static mut RSS_RETA_LEN: usize = 0;
+
+/// Toeplitz hash, sliding-window form.
+fn toeplitz(key: &[u8], data: &[u8]) -> u32 {
+    if key.len() < 4 { return 0; }
+    let mut result: u32 = 0;
+    let mut w = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
+    let mut next_bit = 32usize;
+    let total_key_bits = key.len() * 8;
+    for &byte in data {
+        for b in (0..8).rev() {
+            if (byte >> b) & 1 == 1 {
+                result ^= w;
+            }
+            let kb = if next_bit < total_key_bits {
+                (key[next_bit / 8] >> (7 - (next_bit % 8))) & 1
+            } else {
+                0
+            };
+            w = (w << 1) | (kb as u32);
+            next_bit += 1;
+        }
+    }
+    result
+}
+
+/// Predicted RX queue for a 12-byte tuple in wire order. u16::MAX if the RSS
+/// configuration could not be read.
+fn predict_queue(tuple: &[u8; 12]) -> u16 {
+    let (key_len, reta_len) = unsafe { (RSS_KEY_LEN, RSS_RETA_LEN) };
+    if key_len == 0 || reta_len == 0 {
+        return u16::MAX;
+    }
+    let key = &unsafe { &*core::ptr::addr_of!(RSS_KEY) }[..key_len];
+    let reta = unsafe { &*core::ptr::addr_of!(RSS_RETA) };
+    let h = toeplitz(key, tuple) as usize;
+    reta[h & (reta_len - 1)]
+}
+
+/// Which RX queue an inbound packet for `local_port` would be steered to.
+/// Source is the target, destination is us: the direction the NIC hashes.
+fn queue_for_local_port(our_ip: [u8; 4], local_port: u16) -> u16 {
+    let mut tuple = [0u8; 12];
+    tuple[0..4].copy_from_slice(&TARGET_IP.octets());
+    tuple[4..8].copy_from_slice(&our_ip);
+    tuple[8..10].copy_from_slice(&TARGET_PORT.to_be_bytes());
+    tuple[10..12].copy_from_slice(&local_port.to_be_bytes());
+    predict_queue(&tuple)
+}
+
+/// Mark every ephemeral port whose return traffic lands on `queue_id`.
+fn build_owned_ports(our_ip: [u8; 4], queue_id: u16, bitmap: &mut [u8]) -> u32 {
+    let mut count = 0u32;
+    for i in 0..EPH_LEN {
+        let port = EPH_BASE + i as u16;
+        if queue_for_local_port(our_ip, port) == queue_id {
+            bitmap[i / 8] |= 1 << (i % 8);
+            count += 1;
+        }
+    }
+    count
+}
+
+#[inline]
+fn owns_port(bitmap: *const u8, port: u16) -> bool {
+    if port < EPH_BASE {
+        return true; // non-ephemeral (DHCP etc.) is never ours to filter
+    }
+    let i = (port - EPH_BASE) as usize;
+    unsafe { *bitmap.add(i / 8) & (1 << (i % 8)) != 0 }
+}
+
+/// Read the key and indirection table the device is actually using.
+fn load_rss_config(n_queues: u16) -> bool {
+    let mut key = [0u8; 64];
+    let klen = unsafe { shim_rss_hash_key(0, key.as_mut_ptr(), key.len() as u16) };
+    if klen <= 0 {
+        println!("FAIL: RSS hash key unavailable (rc={})", klen);
+        return false;
+    }
+    unsafe {
+        let dst = &mut *core::ptr::addr_of_mut!(RSS_KEY);
+        dst[..klen as usize].copy_from_slice(&key[..klen as usize]);
+        RSS_KEY_LEN = klen as usize;
+    }
+
+    let mut reta = [0u16; 512];
+    let n = unsafe { shim_rss_reta(0, reta.as_mut_ptr(), reta.len() as u16) };
+    if n <= 0 {
+        println!("FAIL: RSS indirection table unavailable (rc={})", n);
+        return false;
+    }
+    let n = n as usize;
+    if n & (n - 1) != 0 {
+        println!("FAIL: RSS table size {} is not a power of two", n);
+        return false;
+    }
+    unsafe {
+        let dst = &mut *core::ptr::addr_of_mut!(RSS_RETA);
+        dst[..n].copy_from_slice(&reta[..n]);
+        RSS_RETA_LEN = n;
+    }
+    println!("rss: {} queues, {}-entry table, {}-byte key", n_queues, n, klen);
+    true
+}
+
+// ---------------------------------------------------------------------------
 // smoltcp Device on minidpdk. TX writes straight into the mbuf's data
 // area; RX carries the mbuf pointer through the token and frees on
 // consume/drop. `pending_synth` returns one fabricated frame on the next
@@ -278,16 +517,12 @@ struct DpdkDevice {
     queue_id: u16,
     pool: *mut rte_pktmbuf_pool,
     pending_synth: Option<Vec<u8>>,
-    // Half-open port range [port_slab_start, port_slab_start+port_slab_len)
-    // (modulo 2^16) of dst_ports this iface owns. RSS distributes return
-    // SYN-ACKs and later packets by a hash the guest can't predict, so
-    // some packets destined for a sibling worker's connection land on
-    // this queue instead. If we let smoltcp see them, it demux-misses
-    // and sends a RST — killing the sibling's handshake. Drop them
-    // here silently. `port_slab_len = 0` means "accept all ports"
-    // (used by the DHCP/ARP path in learn_network).
-    port_slab_start: u16,
-    port_slab_len: u16,
+    // Bitmap over the ephemeral range of dst_ports this iface owns, i.e.
+    // those whose return traffic RSS steers to this queue. Since source
+    // ports are now chosen so that this always holds, a packet failing the
+    // test means the prediction was wrong — it is counted, not just dropped.
+    // Null means "accept all ports" (the DHCP/ARP path in learn_network).
+    owned_ports: *const u8,
     // Prefetch buffer: rte_eth_rx_burst is cheap in bulk but expensive
     // per call, so we drain up to RX_BURST mbufs at once and hand them
     // to smoltcp one at a time out of these arrays.
@@ -397,8 +632,12 @@ impl Device for DpdkDevice {
                         true
                     } else {
                         let dst_port = ((bytes[l4 + 2] as u16) << 8) | (bytes[l4 + 3] as u16);
-                        self.port_slab_len == 0
-                            || dst_port.wrapping_sub(self.port_slab_start) < self.port_slab_len
+                        let owned = self.owned_ports.is_null()
+                            || owns_port(self.owned_ports, dst_port);
+                        if !owned {
+                            MISROUTED_DROPS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        owned
                     }
                 }
             };
@@ -473,11 +712,23 @@ fn parse_arp_reply_from(frame: &[u8], expected_ip: [u8; 4]) -> Option<[u8; 6]> {
 // DNS; `TARGET_SNI`/`TARGET_HOST` are just the bucket hostname.
 // ---------------------------------------------------------------------------
 
-const TARGET_IP: Ipv4Address = Ipv4Address::new(3, 5, 216, 240);
+// Resolved by `just setup` from the bucket endpoint and baked in. The guest
+// has no resolver by design, so this has to be decided at build time; if it
+// goes stale the run fails loudly with a SYN timeout rather than silently.
+const TARGET_IP_OCTETS: [u8; 4] = parse_ipv4(option_env!("AWS_TARGET_IP"));
+const TARGET_IP: Ipv4Address = Ipv4Address::new(
+    TARGET_IP_OCTETS[0], TARGET_IP_OCTETS[1], TARGET_IP_OCTETS[2], TARGET_IP_OCTETS[3]);
 const TARGET_PORT: u16 = 443;
-const TARGET_SNI: &str = "miniosv-bench-1783870611.s3.eu-north-1.amazonaws.com";
-const TARGET_HOST: &str = "miniosv-bench-1783870611.s3.eu-north-1.amazonaws.com";
-const TARGET_PATH: &[u8] = b"/bench10.bin";
+// Endpoint is baked in at build time from $AWS_BUCKET / $AWS_REGION
+// (see `just setup`).
+const TARGET_HOST: &str = concat!(
+    env!("AWS_BUCKET", "AWS_BUCKET is not set — run `just setup`"),
+    ".s3.",
+    env!("AWS_REGION", "AWS_REGION is not set — run `just setup`"),
+    ".amazonaws.com"
+);
+const TARGET_SNI: &str = TARGET_HOST;
+const TARGET_PATH: &[u8] = b"/blob.bin";
 
 fn build_range_request(buf: &mut [u8], start: u64, end_inclusive: u64) -> usize {
     struct Wr<'a> { buf: &'a mut [u8], used: usize }
@@ -584,10 +835,6 @@ fn make_client_config() -> Arc<ClientConfig> {
 // Sized to hold pipelined records without reallocating during the download.
 const TLS_BUF_CAP: usize = 256 * 1024;
 
-// Bench knob: once the handshake has completed and the GET is on the
-// wire, discard every incoming byte without touching the rustls record
-// layer. Isolates ENA + minidpdk + smoltcp cost from crypto cost.
-const STUB_TLS_AFTER_HANDSHAKE: bool = true;
 
 // Per-connection state driven by one shared iface.poll loop. Each
 // connection carries its own TLS session, its own preformatted GET (with
@@ -596,8 +843,6 @@ const STUB_TLS_AFTER_HANDSHAKE: bool = true;
 struct Conn {
     handle: smoltcp::iface::SocketHandle,
     tls: UnbufferedClientConnection,
-    tls_cfg: Arc<ClientConfig>,
-    tls_server_name: ServerName<'static>,
     incoming: Vec<u8>,
     outgoing: Vec<u8>,
     request: Vec<u8>,
@@ -606,11 +851,60 @@ struct Conn {
     bytes_received: usize,
     done: bool,
     connect_start_ms: i64,
-    // Reconnect scratch — when the SYN never gets ACKed the return
-    // flow hashed to another worker's RSS queue. Bump the source port
-    // and try again until the mapping happens to land on our queue.
-    src_port_next: u16,
-    retries_left: u8,
+    // Identity, for diagnostics that need to name the failing flow.
+    queue_id: u16,
+    src_port: u16,
+    // Plaintext bytes this connection's Range request should yield. The
+    // completeness check compares against this rather than assuming every
+    // connection succeeded.
+    expected: u64,
+    // Set when the peer closed after the response was fully requested, as
+    // opposed to the connection being abandoned.
+    closed_cleanly: bool,
+    // HTTP response header skipping, so `bytes_received` is body-only.
+    headers_done: bool,
+    hdr_state: u8,
+    // --- instrumentation ---
+    // Total SYNs sent, and whether this connection has left SynSent yet
+    // (either established or given up).
+    attempts: u16,
+    settled: bool,
+    start_ms: i64,
+}
+
+// A SYN now only goes unanswered on genuine loss, so the timeout is a
+// backstop rather than a polling interval.
+const SYN_TIMEOUT_MS: i64 = 5_000;
+
+// Test knob: abandon this many connections per worker on purpose. A
+// completeness check that has never been seen to fail is not a check, so
+// setting this to 1 must turn a passing run into an INCOMPLETE one.
+const FAULT_ABANDON_CONNS: usize = 0;
+
+/// Count response *body* bytes only. The HTTP header is application data as
+/// far as TLS is concerned, so counting raw decrypted length overcounts by one
+/// header per connection and makes a byte-exact completeness check impossible.
+/// The CRLFCRLF terminator can straddle records, hence the carried state.
+fn count_body(bytes: &mut usize, headers_done: &mut bool, hdr_state: &mut u8, data: &[u8]) {
+    if *headers_done {
+        *bytes += data.len();
+        return;
+    }
+    for (i, &b) in data.iter().enumerate() {
+        *hdr_state = match (*hdr_state, b) {
+            (0, b'\r') => 1,
+            (1, b'\n') => 2,
+            (2, b'\r') => 3,
+            (3, b'\n') => 4,
+            (_, b'\r') => 1,
+            _ => 0,
+        };
+        if *hdr_state == 4 {
+            *headers_done = true;
+            *bytes += data.len() - (i + 1);
+            return;
+        }
+    }
 }
 
 // Drive one connection forward by one step (RX drain, TX push, TLS state
@@ -618,7 +912,6 @@ struct Conn {
 // reason (clean FIN, SYN timeout, TLS error).
 fn conn_step(
     conn: &mut Conn,
-    iface: &mut Interface,
     sockets: &mut SocketSet<'_>,
     clk: &MonoClock,
 ) -> bool {
@@ -630,32 +923,32 @@ fn conn_step(
     // land on our queue, so a failed try means "wrong port hash" not
     // "network issue". Server RTT is < 1 ms in-region, so 200 ms is
     // still 100× the round-trip.
-    if state == tcp::State::SynSent && now_ms - conn.connect_start_ms > 200 {
+    // Instrumentation: the moment a connection leaves SynSent for Established
+    // is the moment its SYN-ACK finally came back on the right queue. Record
+    // how many SYNs that took and how long it burned.
+    if !conn.settled && state == tcp::State::Established {
+        conn.settled = true;
+        SYN_RETRIES.fetch_add(conn.attempts.saturating_sub(1) as u64, Ordering::Relaxed);
+        SETUP_MS_TOTAL.fetch_add((now_ms - conn.start_ms).max(0) as u64, Ordering::Relaxed);
+        CONNS_ESTABLISHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Source ports are now chosen so the return flow provably hashes to this
+    // worker's queue, so a SYN that goes unanswered is a real failure — a lost
+    // packet or an unreachable peer — not the "wrong port hash, roll again"
+    // case the old retry loop existed to paper over. Give it a generous
+    // window and then fail loudly rather than silently abandoning the range.
+    if state == tcp::State::SynSent && now_ms - conn.connect_start_ms > SYN_TIMEOUT_MS {
         s.abort();
-        if conn.retries_left == 0 {
-            conn.done = true;
-            return true;
+        println!("FAIL: q{} SYN timeout on port {} after {} ms — no SYN-ACK",
+            conn.queue_id, conn.src_port, SYN_TIMEOUT_MS);
+        if !conn.settled {
+            conn.settled = true;
+            CONNS_FAILED.fetch_add(1, Ordering::Relaxed);
+            SETUP_MS_TOTAL.fetch_add((now_ms - conn.start_ms).max(0) as u64, Ordering::Relaxed);
         }
-        conn.retries_left -= 1;
-        let port = conn.src_port_next;
-        conn.src_port_next = conn.src_port_next.wrapping_add(1);
-        conn.incoming.clear();
-        conn.outgoing.clear();
-        conn.request_queued = false;
-        conn.handshake_done = false;
-        conn.connect_start_ms = now_ms;
-        conn.bytes_received = 0;
-        conn.tls = match UnbufferedClientConnection::new(
-            conn.tls_cfg.clone(),
-            conn.tls_server_name.clone(),
-        ) {
-            Ok(c) => c,
-            Err(_) => { conn.done = true; return true; }
-        };
-        // The socket needs a fresh poll cycle before it will accept a
-        // new connect(); calling it here works after abort().
-        let _ = s.connect(iface.context(), (TARGET_IP, TARGET_PORT), port);
-        return false;
+        conn.done = true;
+        return true;
     }
     if !conn.outgoing.is_empty() && s.can_send() {
         if let Ok(n) = s.send_slice(&conn.outgoing) {
@@ -684,7 +977,9 @@ fn conn_step(
             ConnectionState::ReadTraffic(mut rt) => {
                 while let Some(rec) = rt.next_record() {
                     match rec {
-                        Ok(rec) => conn.bytes_received += rec.payload.len(),
+                        Ok(rec) => count_body(&mut conn.bytes_received,
+                            &mut conn.headers_done,
+                            &mut conn.hdr_state, rec.payload),
                         Err(e) => { println!("FAIL: tls record: {:?}", e); conn.done = true; break; }
                     }
                 }
@@ -724,6 +1019,7 @@ fn conn_step(
         tcp::State::Closed | tcp::State::CloseWait | tcp::State::TimeWait
     );
     if conn.handshake_done && conn.request_queued && ended && conn.outgoing.is_empty() {
+        conn.closed_cleanly = true;
         conn.done = true;
     }
     conn.done
@@ -736,13 +1032,10 @@ fn conn_step(
 // worker's slice of the file.
 // ---------------------------------------------------------------------------
 
-const CONNS_PER_WORKER: usize = 24;
 
 #[repr(C)]
 struct WorkerCtx {
     queue_id: u16,
-    local_port: u16,
-    port_slab: u16,
     pool: *mut rte_pktmbuf_pool,
     mac: [u8; 6],
     ip: [u8; 4],
@@ -753,6 +1046,11 @@ struct WorkerCtx {
     range_end_inclusive: u64,
     bytes_received: AtomicU64,
     elapsed_ns: AtomicU64,
+    // Completeness accounting: what this worker's connections were asked to
+    // fetch, and how many finished rather than being abandoned.
+    bytes_expected: AtomicU64,
+    conns_total: AtomicU64,
+    conns_clean: AtomicU64,
 }
 unsafe impl Send for WorkerCtx {}
 unsafe impl Sync for WorkerCtx {}
@@ -762,12 +1060,20 @@ extern "C" fn worker_thread(arg: *mut c_void) {
     let clk = MonoClock::new();
     let ip = Ipv4Address::new(ctx.ip[0], ctx.ip[1], ctx.ip[2], ctx.ip[3]);
     let gw = Ipv4Address::new(ctx.gateway_ip[0], ctx.gateway_ip[1], ctx.gateway_ip[2], ctx.gateway_ip[3]);
+
+    // Work out which source ports steer back to this worker's queue. The
+    // bitmap is leaked so its pointer stays valid for the thread's lifetime;
+    // workers never return.
+    let owned: &'static mut [u8] =
+        Box::leak(alloc::vec![0u8; OWNED_BITMAP_BYTES].into_boxed_slice());
+    let owned_count = build_owned_ports(ctx.ip, ctx.queue_id, owned);
+    let owned_ptr: *const u8 = owned.as_ptr();
+
     let mut dev = DpdkDevice {
         queue_id: ctx.queue_id,
         pool: ctx.pool,
         pending_synth: Some(build_arp_reply(ctx.gateway_mac, gw.octets(), ctx.mac, ip.octets())),
-        port_slab_start: ctx.local_port,
-        port_slab_len: ctx.port_slab,
+        owned_ports: owned_ptr,
         rx_pref_handles: [ptr::null_mut(); RX_BURST],
         rx_pref_data:    [ptr::null();     RX_BURST],
         rx_pref_lens:    [0;               RX_BURST],
@@ -807,22 +1113,51 @@ extern "C" fn worker_thread(arg: *mut c_void) {
         Err(_) => { println!("FAIL: invalid ServerName"); return; }
     };
 
-    // Split the worker's byte range across M connections.
+    // Split the worker's byte range across the connections it can actually
+    // open. Computed after port selection so a worker short of usable ports
+    // still covers its whole range rather than silently dropping the tail.
     let span = ctx.range_end_inclusive - ctx.range_start + 1;
-    let per_conn = span / (CONNS_PER_WORKER as u64);
 
-    let mut conns: Vec<Conn> = Vec::with_capacity(CONNS_PER_WORKER);
-    for i in 0..CONNS_PER_WORKER {
+    // Collect this worker's owned ports, spread across the range rather than
+    // taken consecutively — adjacent ports are no more likely to collide, but
+    // spreading keeps the choice independent of any local structure in the
+    // hash.
+    let mut my_ports: Vec<u16> = Vec::with_capacity(CONNS_PER_WORKER);
+    {
+        let stride = core::cmp::max(1, (owned_count as usize) / CONNS_PER_WORKER);
+        let mut seen = 0usize;
+        for i in 0..EPH_LEN {
+            if my_ports.len() == CONNS_PER_WORKER { break; }
+            let port = EPH_BASE + i as u16;
+            if owns_port(owned_ptr, port) {
+                if seen % stride == 0 { my_ports.push(port); }
+                seen += 1;
+            }
+        }
+    }
+    if my_ports.len() < CONNS_PER_WORKER {
+        println!("q{}: only {} usable ports for {} connections",
+            ctx.queue_id, my_ports.len(), CONNS_PER_WORKER);
+    }
+    println!("q{}: {} of {} ephemeral ports steer here; using {}",
+        ctx.queue_id, owned_count, EPH_LEN, my_ports.len());
+
+    let n_conns = core::cmp::min(CONNS_PER_WORKER, my_ports.len());
+    let per_conn = span / core::cmp::max(1, n_conns as u64);
+
+    let mut conns: Vec<Conn> = Vec::with_capacity(n_conns);
+    // Ranges are split across all n_conns, but fault injection skips creating
+    // the last few — leaving their byte ranges genuinely unrequested, which is
+    // exactly the failure the completeness check has to catch.
+    for i in 0..n_conns.saturating_sub(FAULT_ABANDON_CONNS) {
         let start = ctx.range_start + (i as u64) * per_conn;
-        let end = if i == CONNS_PER_WORKER - 1 {
+        let end = if i == n_conns - 1 {
             ctx.range_end_inclusive
         } else {
             start + per_conn - 1
         };
-        // Give each connection a sub-slab within the worker's slab.
-        // SYN-timeout retries bump the port by 1 and stay inside it.
-        let per_conn_stride: u16 = ctx.port_slab / (CONNS_PER_WORKER as u16);
-        let src_port = ctx.local_port.wrapping_add((i as u16) * per_conn_stride);
+        // Chosen so the return flow provably hashes to this worker's queue.
+        let src_port = my_ports[i];
         {
             let s = sockets.get_mut::<tcp::Socket>(handles[i]);
             if s.connect(iface.context(), (TARGET_IP, TARGET_PORT), src_port).is_err() {
@@ -839,8 +1174,6 @@ extern "C" fn worker_thread(arg: *mut c_void) {
         conns.push(Conn {
             handle: handles[i],
             tls,
-            tls_cfg: cfg.clone(),
-            tls_server_name: server_name.clone(),
             incoming: Vec::with_capacity(TLS_BUF_CAP),
             outgoing: Vec::with_capacity(TLS_BUF_CAP),
             request: request_buf[..n].to_vec(),
@@ -849,8 +1182,15 @@ extern "C" fn worker_thread(arg: *mut c_void) {
             bytes_received: 0,
             done: false,
             connect_start_ms: clk.elapsed_ms(),
-            src_port_next: src_port.wrapping_add(1),
-            retries_left: 32,
+            queue_id: ctx.queue_id,
+            src_port,
+            expected: end - start + 1,
+            closed_cleanly: false,
+            headers_done: false,
+            hdr_state: 0,
+            attempts: 1,
+            settled: false,
+            start_ms: clk.elapsed_ms(),
         });
     }
 
@@ -860,15 +1200,32 @@ extern "C" fn worker_thread(arg: *mut c_void) {
         iface.poll(Instant::from_millis(now_ms), &mut dev, &mut sockets);
         let mut all_done = true;
         for c in conns.iter_mut() {
-            let d = conn_step(c, &mut iface, &mut sockets, &clk);
+            let d = conn_step(c, &mut sockets, &clk);
             if !d { all_done = false; }
         }
+        // Instrumentation: announce once, as soon as every connection has
+        // either established or exhausted its retries. This is the point the
+        // diagnostic summary can be printed — it does not wait for the
+        // transfer, so it lands within seconds of boot.
         if all_done { break; }
     }
     let elapsed_ns = clk.elapsed_ns().saturating_sub(start_ns);
     let total: usize = conns.iter().map(|c| c.bytes_received).sum();
     ctx.bytes_received.store(total as u64, Ordering::Relaxed);
     ctx.elapsed_ns.store(elapsed_ns, Ordering::Relaxed);
+    ctx.bytes_expected.store(conns.iter().map(|c| c.expected).sum(), Ordering::Relaxed);
+    ctx.conns_total.store(conns.len() as u64, Ordering::Relaxed);
+    ctx.conns_clean.store(
+        conns.iter().filter(|c| c.closed_cleanly).count() as u64, Ordering::Relaxed);
+
+    // A worker that could not open a connection for part of its range never
+    // requested those bytes at all — surface it here, not as a silent gap.
+    for c in conns.iter() {
+        if !c.closed_cleanly {
+            println!("q{}: conn on port {} did not close cleanly ({} of {} B)",
+                ctx.queue_id, c.src_port, c.bytes_received, c.expected);
+        }
+    }
 }
 
 
@@ -883,7 +1240,7 @@ fn learn_network(
         // DHCP / gateway-ARP path: accept every packet (len=0 disables).
         let mut dev = DpdkDevice {
             queue_id: 0, pool, pending_synth: None,
-            port_slab_start: 0, port_slab_len: 0,
+            owned_ports: ptr::null(),
             rx_pref_handles: [ptr::null_mut(); RX_BURST],
             rx_pref_data:    [ptr::null();     RX_BURST],
             rx_pref_lens:    [0;               RX_BURST],
@@ -946,8 +1303,20 @@ fn learn_network(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osv_app_main() {
-    const N_REQ: u16 = 32;
-    const FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+
+    let t = TARGET_IP.octets();
+    println!("bench: {} workers x {} conns, {} MiB object, tls_stub={}",
+        N_WORKERS_REQ, CONNS_PER_WORKER, FILE_SIZE / (1024 * 1024),
+        STUB_TLS_AFTER_HANDSHAKE);
+    println!("target: {}.{}.{}.{}:{} {}", t[0], t[1], t[2], t[3], TARGET_PORT, TARGET_HOST);
+    if t == [0, 0, 0, 0] {
+        println!("FAIL: AWS_TARGET_IP is unset or malformed — run `just setup smoltcp-s3`");
+        loop { core::hint::spin_loop(); }
+    }
+    if FILE_SIZE == 0 || CONNS_PER_WORKER == 0 || N_WORKERS_REQ == 0 {
+        println!("FAIL: BENCH_WORKERS, BENCH_CONNS_PER_WORKER and AWS_BUCKET_SIZE must be nonzero");
+        loop { core::hint::spin_loop(); }
+    }
 
     // Clamp to what the device advertises. ENA VFs cap io-queue count
     // per instance size; rx_queue_setup for qid >= max is a hard reject.
@@ -955,9 +1324,9 @@ pub extern "C" fn osv_app_main() {
     let mut max_tx: u16 = 0;
     unsafe { shim_get_dev_info(0, &mut max_rx, &mut max_tx) };
     let dev_max = core::cmp::min(max_rx, max_tx);
-    let n = if dev_max == 0 { N_REQ } else { core::cmp::min(N_REQ, dev_max) };
-    if n != N_REQ {
-        println!("clamping workers {} -> {} (device max)", N_REQ, n);
+    let n = if dev_max == 0 { N_WORKERS_REQ } else { core::cmp::min(N_WORKERS_REQ, dev_max) };
+    if n != N_WORKERS_REQ {
+        println!("clamping workers {} -> {} (device max)", N_WORKERS_REQ, n);
     }
     let n_queues: u16 = n;
     let n_workers: u64 = n as u64;
@@ -967,11 +1336,18 @@ pub extern "C" fn osv_app_main() {
         loop { core::hint::spin_loop(); }
     });
 
+    if !load_rss_config(n_queues) {
+        println!("FAIL: cannot predict RSS steering without the key and table");
+        loop { core::hint::spin_loop(); }
+    }
+
     let (ip, prefix_len, gw, gw_mac) = learn_network(pools[0].0, mac).unwrap_or_else(|| {
         loop { core::hint::spin_loop(); }
     });
     let ip_bytes = ip.octets();
     let gw_bytes = gw.octets();
+
+    N_WORKERS.store(n_workers, Ordering::Relaxed);
 
     // Split the file across n_workers via HTTP Range so total bytes =
     // FILE_SIZE (not n_workers * FILE_SIZE).
@@ -980,15 +1356,10 @@ pub extern "C" fn osv_app_main() {
     for i in 0..n_workers {
         let start = i * chunk;
         let end_inclusive = if i == n_workers - 1 { FILE_SIZE - 1 } else { start + chunk - 1 };
-        // Split the ephemeral range 49152..65536 into n_workers disjoint slabs
-        // so each worker's M connections (and their retries) can never
-        // collide with another worker's 4-tuples.
-        let port_slab: u16 = 16384 / n_queues;
-        let local_port = 49152 + (i as u16) * port_slab;
+        // No port slabs: each worker derives its own ports from the RSS
+        // hash, and the hash partitions the range disjointly by construction.
         let ctx = Box::new(WorkerCtx {
             queue_id: i as u16,
-            local_port,
-            port_slab,
             pool: pools[i as usize].0,
             mac,
             ip: ip_bytes,
@@ -999,6 +1370,9 @@ pub extern "C" fn osv_app_main() {
             range_end_inclusive: end_inclusive,
             bytes_received: AtomicU64::new(0),
             elapsed_ns: AtomicU64::new(0),
+            bytes_expected: AtomicU64::new(0),
+            conns_total: AtomicU64::new(0),
+            conns_clean: AtomicU64::new(0),
         });
         ctxs.push(ctx);
     }
@@ -1011,10 +1385,16 @@ pub extern "C" fn osv_app_main() {
     let overall_ns = overall_clk.elapsed_ns();
 
     let mut total_b: u64 = 0;
+    let mut total_expected: u64 = 0;
+    let mut conns_total: u64 = 0;
+    let mut conns_clean: u64 = 0;
     for (i, ctx) in ctxs.iter().enumerate() {
         let b = ctx.bytes_received.load(Ordering::Relaxed);
         let e = ctx.elapsed_ns.load(Ordering::Relaxed) as f64 / 1e9;
         total_b += b;
+        total_expected += ctx.bytes_expected.load(Ordering::Relaxed);
+        conns_total += ctx.conns_total.load(Ordering::Relaxed);
+        conns_clean += ctx.conns_clean.load(Ordering::Relaxed);
         println!("worker {} (q{}): {} B / {:.3} s  ({:.1} MB/s)",
             i, i, b, e, (b as f64 / 1e6) / e.max(1e-9));
     }
@@ -1025,6 +1405,55 @@ pub extern "C" fn osv_app_main() {
         overall_s,
         total_b as f64 / 1e6 / overall_s.max(1e-9),
         total_b as f64 * 8.0 / 1e9 / overall_s.max(1e-9));
+
+    // Completeness. Two things must hold, and they are separate questions:
+    // every range was actually requested (a connection that never opened
+    // abandons its range silently), and enough bytes arrived to cover them.
+    let ranges_ok = conns_clean == conns_total && conns_total > 0;
+    let covered = total_expected == FILE_SIZE;
+    let misrouted = MISROUTED_DROPS.load(Ordering::Relaxed);
+    let retries = SYN_RETRIES.load(Ordering::Relaxed);
+    let failed = CONNS_FAILED.load(Ordering::Relaxed);
+    let setup_ms = SETUP_MS_TOTAL.load(Ordering::Relaxed);
+
+    println!();
+    println!("connections   : {}/{} closed cleanly, {} failed", conns_clean, conns_total, failed);
+    println!("syn retries   : {} (expected 0)", retries);
+    println!("misrouted rx  : {} packets dropped (expected 0)", misrouted);
+    println!("setup         : {} ms total, {:.1} ms/conn",
+        setup_ms, setup_ms as f64 / (conns_total.max(1)) as f64);
+    println!("ranges        : {} of {} bytes requested", total_expected, FILE_SIZE);
+
+    if STUB_TLS_AFTER_HANDSHAKE {
+        // Ciphertext, so it carries TLS record and HTTP header overhead and
+        // cannot be compared byte-for-byte against the plaintext ranges.
+        let overhead = total_b as f64 - total_expected as f64;
+        println!("bytes         : {} on the wire (ciphertext, {:+.2}%)",
+            total_b, overhead * 100.0 / (total_expected.max(1)) as f64);
+    } else {
+        println!("bytes         : {} plaintext body", total_b);
+    }
+
+    let bytes_ok = if STUB_TLS_AFTER_HANDSHAKE {
+        total_b >= total_expected
+    } else {
+        total_b == total_expected
+    };
+
+    if ranges_ok && covered && bytes_ok && misrouted == 0 {
+        if STUB_TLS_AFTER_HANDSHAKE {
+            println!("COMPLETE: all {} ranges fetched (set BENCH_TLS_STUB=0 for a byte-exact check)",
+                conns_total);
+        } else {
+            println!("COMPLETE: {} bytes, byte-exact", total_b);
+        }
+    } else {
+        println!("INCOMPLETE: {} connections abandoned, {} bytes unrequested, {} bytes {}",
+            conns_total - conns_clean,
+            FILE_SIZE.saturating_sub(total_expected),
+            if total_b > total_expected { total_b - total_expected } else { total_expected - total_b },
+            if total_b > total_expected { "over" } else { "short" });
+    }
 
     unsafe { shim_dev_stop(0) };
     loop { core::hint::spin_loop(); }

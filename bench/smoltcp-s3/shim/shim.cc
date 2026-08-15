@@ -28,7 +28,12 @@ constexpr uint64_t kWantedTxOffloads =
 constexpr uint64_t kWantedRxOffloads =
     RTE_ETH_RX_OFFLOAD_IPV4_CKSUM |
     RTE_ETH_RX_OFFLOAD_TCP_CKSUM |
-    RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
+    RTE_ETH_RX_OFFLOAD_UDP_CKSUM |
+    // Ask the NIC to hand us the RSS hash it computed for each packet.
+    // Besides being the ground truth for validating a software Toeplitz,
+    // this bit also gates ena_rss_reta_query() and ena_rss_hash_conf_get()
+    // — without it the guest cannot read back either the table or the key.
+    RTE_ETH_RX_OFFLOAD_RSS_HASH;
 
 uint64_t g_tx_offloads = 0;
 uint64_t g_rx_offloads = 0;
@@ -200,6 +205,78 @@ int shim_mbuf_tx(uint16_t port_id, uint16_t queue_id, void *handle,
 
 void shim_mbuf_free(void *handle) {
   if (handle) rte_pktmbuf_free(static_cast<rte_mbuf *>(handle));
+}
+
+// The RSS hash the NIC computed for this packet, or 0 if the device did
+// not tag it. Ground truth for validating a software Toeplitz.
+uint32_t shim_mbuf_rss_hash(void *handle) {
+  auto *m = static_cast<rte_mbuf *>(handle);
+  if (m == nullptr || !(m->ol_flags & RTE_MBUF_F_RX_RSS_HASH)) return 0;
+  return m->hash.rss;
+}
+
+// What the device actually accepted, after masking against rx_offload_capa.
+uint64_t shim_rx_offloads(void) { return g_rx_offloads; }
+
+// --- RSS introspection -----------------------------------------------------
+// The key the NIC is hashing with, and the indirection table it steers by.
+// Both are read from the device/driver rather than assumed, so the port ->
+// queue prediction can be built on measured values.
+
+int shim_rss_hash_key(uint16_t port_id, uint8_t *out_key, uint16_t out_len) {
+  rte_eth_dev *dev = lookup_dev(port_id);
+  if (dev == nullptr || out_key == nullptr) return -1;
+
+  rte_eth_dev_info info;
+  std::memset(&info, 0, sizeof(info));
+  dev->get_dev_info(&info);
+  if (info.hash_key_size == 0 || out_len < info.hash_key_size) return -1;
+
+  rte_eth_rss_conf conf;
+  std::memset(&conf, 0, sizeof(conf));
+  conf.rss_key = out_key;
+  conf.rss_key_len = static_cast<uint8_t>(info.hash_key_size);
+  const int rc = dev->rss_hash_conf_get(&conf);
+  if (rc != 0) return rc;
+  return info.hash_key_size;
+}
+
+// Number of indirection-table entries the device is using.
+int shim_rss_reta_size(uint16_t port_id) {
+  rte_eth_dev *dev = lookup_dev(port_id);
+  if (dev == nullptr) return -1;
+  rte_eth_dev_info info;
+  std::memset(&info, 0, sizeof(info));
+  dev->get_dev_info(&info);
+  return static_cast<int>(info.reta_size);
+}
+
+// Copy the indirection table into `out` as one queue id per entry.
+int shim_rss_reta(uint16_t port_id, uint16_t *out, uint16_t out_entries) {
+  rte_eth_dev *dev = lookup_dev(port_id);
+  if (dev == nullptr || out == nullptr) return -1;
+
+  const int reta_size = shim_rss_reta_size(port_id);
+  if (reta_size <= 0) return -1;
+  uint16_t n = static_cast<uint16_t>(reta_size);
+  if (n > out_entries) n = out_entries;
+
+  // The query API works in groups of RTE_ETH_RETA_GROUP_SIZE entries, each
+  // with a bitmask selecting which entries of the group to fill.
+  const uint16_t groups =
+      (n + RTE_ETH_RETA_GROUP_SIZE - 1) / RTE_ETH_RETA_GROUP_SIZE;
+  if (groups > 8) return -1;  // 8 * 64 = 512 entries, the largest ENA table
+  rte_eth_rss_reta_entry64 conf[8];
+  std::memset(conf, 0, sizeof(conf));
+  for (uint16_t g = 0; g < groups; g++) conf[g].mask = ~0ull;
+
+  const int rc = dev->rss_reta_query(conf, n);
+  if (rc != 0) return rc;
+
+  for (uint16_t i = 0; i < n; i++) {
+    out[i] = conf[i / RTE_ETH_RETA_GROUP_SIZE].reta[i % RTE_ETH_RETA_GROUP_SIZE];
+  }
+  return n;
 }
 
 int shim_mbuf_rx_burst(uint16_t port_id, uint16_t queue_id, void **out_handle,

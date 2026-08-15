@@ -49,6 +49,20 @@ int shim_mbuf_tx(uint16_t port_id, uint16_t queue_id, void *handle,
                   uint16_t len);
 void shim_mbuf_free(void *handle);
 
+// RSS hash the NIC computed for this packet (0 if untagged), and the RX
+// offload mask the device actually accepted.
+uint32_t shim_mbuf_rss_hash(void *handle);
+uint64_t shim_rx_offloads(void);
+
+// RSS introspection. `shim_rss_hash_key` writes the device's current
+// Toeplitz key into out_key and returns its length in bytes (negative on
+// failure). `shim_rss_reta` writes one queue id per indirection-table entry
+// and returns the number written. Together they are everything needed to
+// predict which RX queue a given 4-tuple will land on.
+int shim_rss_hash_key(uint16_t port_id, uint8_t *out_key, uint16_t out_len);
+int shim_rss_reta_size(uint16_t port_id);
+int shim_rss_reta(uint16_t port_id, uint16_t *out, uint16_t out_entries);
+
 // Zero-copy RX. Return 1 with (*out_handle, *out_data, *out_len) set;
 // or 0 if no packet is available OR the NIC flagged a bad checksum
 // (in which case the mbuf is freed internally).
