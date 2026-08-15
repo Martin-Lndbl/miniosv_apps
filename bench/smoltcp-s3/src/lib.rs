@@ -11,7 +11,7 @@ use core::ffi::{c_int, c_void};
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -97,29 +97,61 @@ extern "C" {
     fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
 }
 
-struct Stdout;
+/// Formats a whole line into a stack buffer so it can be handed to the console
+/// in exactly one write. `write_fmt` calls `write_str` once per format
+/// fragment, so writing directly let concurrent workers interleave *within* a
+/// line, producing output like "q2: 2048 of 16384 ... using q245".
+struct LineBuf {
+    buf: [u8; LINE_MAX],
+    used: usize,
+}
 
-impl Write for Stdout {
+const LINE_MAX: usize = 256;
+
+impl Write for LineBuf {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let bytes = s.as_bytes();
-        let mut off = 0;
-        while off < bytes.len() {
-            let n = unsafe { write(1, bytes[off..].as_ptr(), bytes.len() - off) };
-            if n <= 0 {
-                return Err(fmt::Error);
-            }
-            off += n as usize;
-        }
-        Ok(())
+        let space = self.buf.len() - self.used;
+        let n = core::cmp::min(s.len(), space);
+        self.buf[self.used..self.used + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.used += n;
+        Ok(()) // silently truncate rather than fail a diagnostic print
     }
 }
 
+/// Guards the console so two workers cannot interleave their lines. Printing
+/// happens at startup and teardown only, so spinning here costs nothing on the
+/// data path.
+static PRINT_LOCK: AtomicBool = AtomicBool::new(false);
+
+fn print_line(args: fmt::Arguments) {
+    let mut line = LineBuf { buf: [0; LINE_MAX], used: 0 };
+    let _ = line.write_fmt(args);
+    if line.used == line.buf.len() {
+        line.used -= 1; // make room for the newline on a truncated line
+    }
+    line.buf[line.used] = b'\n';
+    line.used += 1;
+
+    while PRINT_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    let mut off = 0;
+    while off < line.used {
+        let n = unsafe { write(1, line.buf[off..].as_ptr(), line.used - off) };
+        if n <= 0 {
+            break;
+        }
+        off += n as usize;
+    }
+    PRINT_LOCK.store(false, Ordering::Release);
+}
+
 macro_rules! println {
-    () => {{ let _ = Stdout.write_str("\n"); }};
-    ($($arg:tt)*) => {{
-        let _ = Stdout.write_fmt(format_args!($($arg)*));
-        let _ = Stdout.write_str("\n");
-    }};
+    () => { print_line(format_args!("")) };
+    ($($arg:tt)*) => { print_line(format_args!($($arg)*)) };
 }
 
 // ---------------------------------------------------------------------------
