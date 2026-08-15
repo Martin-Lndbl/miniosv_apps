@@ -245,9 +245,14 @@ fn probe_and_open(n_queues: u16) -> Option<(Vec<PktPool>, [u8; 6])> {
     const DATA_ROOM_SIZE: u16 = 1536;
     const DESC_NUM: u16 = 1024;
     const CACHE: u32 = 64;
-    // Each queue's RX ring pins DESC_NUM-1 mbufs; one ring's worth of
-    // slack covers TX and in-flight app buffers.
-    let per_queue_size: u32 = (DESC_NUM as u32) * 2;
+    // Size for every simultaneous holder rather than the RX ring plus a
+    // guess: the RX ring pins DESC_NUM-1, the TX ring holds up to DESC_NUM
+    // more awaiting reclaim, the per-core cache holds CACHE, and the RX
+    // prefetch holds RX_BURST. At DESC_NUM*2 the pool fell ~100 mbufs short
+    // of that worst case, and exhaustion silently discarded frames — a
+    // dropped SYN is then indistinguishable from an unanswered one.
+    let per_queue_size: u32 =
+        (DESC_NUM as u32) * 2 + CACHE + RX_BURST as u32 + 512;
 
     let mut pools: Vec<PktPool> = Vec::with_capacity(n_queues as usize);
     for q in 0..n_queues {
@@ -396,6 +401,10 @@ static CONNS_ESTABLISHED: AtomicU64 = AtomicU64::new(0);
 static CONNS_FAILED: AtomicU64 = AtomicU64::new(0);
 /// Extra SYNs beyond the first. Should be 0.
 static SYN_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// Frames dropped before reaching the NIC: no mbuf available, or the TX ring
+/// refused them. Both are invisible to smoltcp, which believes it sent them.
+static TX_ALLOC_FAIL: AtomicU64 = AtomicU64::new(0);
+static TX_BURST_FAIL: AtomicU64 = AtomicU64::new(0);
 static SETUP_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static N_WORKERS: AtomicU64 = AtomicU64::new(0);
@@ -600,7 +609,10 @@ impl<'a> TxToken for DpdkTxToken<'a> {
         let mut cap: u16 = 0;
         let data = unsafe { shim_mbuf_alloc_tx(self.dev.pool, self.dev.queue_id, &mut handle, &mut cap) };
         if data.is_null() || handle.is_null() {
-            // Pool exhausted; smoltcp still wants `f` called — discard.
+            // Pool exhausted. smoltcp still wants `f` called, so the frame is
+            // discarded — but count it: dropping a SYN silently here looks
+            // exactly like the peer never answering.
+            TX_ALLOC_FAIL.fetch_add(1, Ordering::Relaxed);
             let mut scratch = [0u8; MTU];
             let n = core::cmp::min(len, scratch.len());
             return f(&mut scratch[..n]);
@@ -608,7 +620,9 @@ impl<'a> TxToken for DpdkTxToken<'a> {
         let n = core::cmp::min(len, cap as usize);
         let slice = unsafe { core::slice::from_raw_parts_mut(data, n) };
         let r = f(slice);
-        let _ = unsafe { shim_mbuf_tx(0, self.dev.queue_id, handle, n as u16) };
+        if unsafe { shim_mbuf_tx(0, self.dev.queue_id, handle, n as u16) } != 0 {
+            TX_BURST_FAIL.fetch_add(1, Ordering::Relaxed);
+        }
         r
     }
 }
@@ -1460,6 +1474,8 @@ pub extern "C" fn osv_app_main() {
     println!("connections   : {}/{} closed cleanly, {} failed", conns_clean, conns_total, failed);
     println!("syn retries   : {} (expected 0)", retries);
     println!("misrouted rx  : {} packets dropped (expected 0)", misrouted);
+    println!("tx drops      : {} no-mbuf, {} ring-full (expected 0)",
+        TX_ALLOC_FAIL.load(Ordering::Relaxed), TX_BURST_FAIL.load(Ordering::Relaxed));
     println!("setup         : {} ms total, {:.1} ms/conn",
         setup_ms, setup_ms as f64 / (conns_total.max(1)) as f64);
     println!("blocks        : {}/{} of {} MiB requested ({} bytes)",
