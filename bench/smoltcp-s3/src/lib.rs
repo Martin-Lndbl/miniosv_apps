@@ -982,8 +982,14 @@ fn conn_step(
             if n > 0 { conn.outgoing.drain(..n); }
         }
     }
-    if s.can_recv() {
-        let _ = s.recv(|buf| { conn.incoming.extend_from_slice(buf); (buf.len(), ()) });
+    // Drain until the socket is empty, not once: smoltcp hands back the
+    // largest *contiguous* slice of its ring, so a single call leaves the
+    // remainder behind whenever the data has wrapped.
+    while s.can_recv() {
+        match s.recv(|buf| { conn.incoming.extend_from_slice(buf); (buf.len(), buf.len()) }) {
+            Ok(n) if n > 0 => continue,
+            _ => break,
+        }
     }
 
     if STUB_TLS_AFTER_HANDSHAKE && conn.handshake_done && conn.request_queued {
@@ -1041,11 +1047,17 @@ fn conn_step(
         conn.incoming.drain(..discard);
     }
 
+    // Re-read the state: `state` was sampled before this iteration drained the
+    // socket and advanced TLS. Requiring the receive buffer to be empty as well
+    // is what stops a connection being called complete while bytes are still
+    // sitting in it — the peer's FIN can arrive with data still buffered, and
+    // declaring done there silently drops the tail of the transfer.
     let ended = matches!(
-        state,
+        s.state(),
         tcp::State::Closed | tcp::State::CloseWait | tcp::State::TimeWait
     );
-    if conn.handshake_done && conn.request_queued && ended && conn.outgoing.is_empty() {
+    if conn.handshake_done && conn.request_queued && ended
+        && conn.outgoing.is_empty() && !s.can_recv() {
         conn.closed_cleanly = true;
         conn.done = true;
     }
