@@ -1,0 +1,175 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+# .env stays in the miniosv_ctrl checkout that holds this submodule: direnv,
+# the devshell and the root justfile all read it from there.
+env_file := parent_directory(parent_directory(parent_directory(justfile_directory()))) / ".env"
+
+# Object the bench GETs — must match TARGET_PATH in src/lib.rs.
+blob := "blob.bin"
+
+# List available recipes
+default:
+    @just --list
+
+# Probe the local environment, then write the answers to .env
+setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    env_file="{{ env_file }}"
+
+    # Re-running setup keeps the previous answers as defaults.
+    if [ -f "$env_file" ]; then
+        set -a
+        . "$env_file"
+        set +a
+    fi
+
+    if ! aws sts get-caller-identity >/dev/null 2>&1; then
+        echo "not logged in to aws — running 'aws login --remote'"
+        aws login --remote
+    fi
+
+    ask() {
+        local prompt="$1" default="${2-}" answer=""
+        if [ -t 0 ]; then
+            read -r -p "$prompt [$default]: " answer || true
+        fi
+        printf '%s' "${answer:-$default}"
+    }
+
+    size=$(ask "blob size" "${AWS_BUCKET_SIZE:-10G}")
+    bytes=$(numfmt --from=iec "$size" 2>/dev/null) \
+        || { echo "bad size: $size (try 10G)" >&2; exit 1; }
+
+    region_default="${AWS_REGION:-$(aws configure get region 2>/dev/null || true)}"
+    region=$(ask "aws region" "${region_default:-eu-north-1}")
+    export AWS_REGION="$region"
+
+    bucket=$(ask "s3 bucket (type 'create' for a new one)" "${AWS_BUCKET:-create}")
+
+    if [ "$bucket" = "create" ] || [ -z "$bucket" ]; then
+        bucket="miniosv-bench-$(date +%s)"
+
+        echo "creating s3://$bucket in $region"
+        if [ "$region" = "us-east-1" ]; then
+            aws s3api create-bucket --bucket "$bucket" --region "$region" >/dev/null
+        else
+            aws s3api create-bucket --bucket "$bucket" --region "$region" \
+                --create-bucket-configuration LocationConstraint="$region" >/dev/null
+        fi
+    elif ! aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
+        echo "s3://$bucket is not reachable — answer 'create' to make a new one" >&2
+        exit 1
+    fi
+
+    # The blob is checked every run: an existing bucket may have lost it, or
+    # AWS_BUCKET_SIZE may have changed since it was uploaded.
+    have=$(aws s3api head-object --bucket "$bucket" --key "{{ blob }}" \
+        --query ContentLength --output text 2>/dev/null || true)
+    if [ "$have" = "$bytes" ]; then
+        echo "s3://$bucket/{{ blob }} is already $size"
+    else
+        echo "uploading $size to s3://$bucket/{{ blob }}"
+        head -c "$bytes" /dev/urandom \
+            | aws s3 cp - "s3://$bucket/{{ blob }}" --expected-size "$bytes"
+    fi
+
+    # The bench GETs the blob unsigned, so the bucket stays private and the
+    # read is granted to the S3 gateway endpoint instead. The instance has to
+    # run in a subnet routed through it — that is what 'just deploy' passes.
+    vpce=$(aws ec2 describe-vpc-endpoints \
+        --filters "Name=service-name,Values=com.amazonaws.$region.s3" \
+                  "Name=vpc-endpoint-type,Values=Gateway" \
+        --query "VpcEndpoints[0].VpcEndpointId" --output text 2>/dev/null || true)
+
+    if [ -z "$vpce" ] || [ "$vpce" = "None" ]; then
+        vpc=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" \
+            --query "Vpcs[0].VpcId" --output text)
+        rtb=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc" \
+            --query "RouteTables[?Associations[?Main]].RouteTableId | [0]" --output text)
+        echo "creating an s3 gateway endpoint in $vpc"
+        vpce=$(aws ec2 create-vpc-endpoint --vpc-id "$vpc" \
+            --service-name "com.amazonaws.$region.s3" --route-table-ids "$rtb" \
+            --query "VpcEndpoint.VpcEndpointId" --output text)
+    fi
+
+    read -r vpc rtbs <<<"$(aws ec2 describe-vpc-endpoints --vpc-endpoint-ids "$vpce" \
+        --query "VpcEndpoints[0].[VpcId,join(' ', RouteTableIds)]" --output text)"
+
+    # Prefer a subnet explicitly attached to one of the endpoint's route
+    # tables; when the endpoint sits on the main table, any subnet will do.
+    subnet=""
+    if [ -n "${rtbs:-}" ]; then
+        subnet=$(aws ec2 describe-route-tables --route-table-ids $rtbs \
+            --query "RouteTables[].Associations[?SubnetId].SubnetId | []" \
+            --output text | tr '\t' '\n' | head -1)
+    fi
+    if [ -z "$subnet" ]; then
+        subnet=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc" \
+            --query "Subnets[0].SubnetId" --output text)
+    fi
+
+    echo "granting $vpce read on s3://$bucket/{{ blob }}"
+    policy=$(printf '{"Version":"2012-10-17","Statement":[{"Sid":"BenchBlobFromVpce","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/%s","Condition":{"StringEquals":{"aws:sourceVpce":"%s"}}}]}' \
+        "$bucket" "{{ blob }}" "$vpce")
+    aws s3api put-bucket-policy --bucket "$bucket" --policy "$policy"
+
+    {
+        echo "# Generated by 'just setup'. Edit freely; re-running keeps your answers."
+        printf 'AWS_BUCKET_SIZE="%s"\n' "$size"
+        printf 'AWS_REGION="%s"\n' "$region"
+        printf 'AWS_BUCKET="%s"\n' "$bucket"
+        printf 'AWS_SUBNET="%s"\n' "$subnet"
+    } > "$env_file"
+
+    echo "wrote $env_file — reload the devshell to pick it up (direnv does it for you)"
+
+# Delete the bucket named in .env, then .env itself ('just clean force' skips the prompt)
+clean *force:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    env_file="{{ env_file }}"
+
+    if [ -f "$env_file" ]; then
+        set -a
+        . "$env_file"
+        set +a
+    fi
+
+    bucket="${AWS_BUCKET:-}"
+
+    if [ -z "$bucket" ] && [ ! -f "$env_file" ]; then
+        echo "nothing to clean up"
+        exit 0
+    fi
+
+    echo "about to delete:"
+    if [ -n "$bucket" ]; then echo "  s3://$bucket"; fi
+    if [ -f "$env_file" ]; then echo "  $env_file"; fi
+
+    if [ "{{ force }}" != "force" ]; then
+        if [ -t 0 ]; then
+            read -r -p "proceed? [y/N]: " answer || true
+            [ "${answer:-}" = "y" ] || { echo "aborted" >&2; exit 1; }
+        else
+            echo "refusing without a tty — use 'just clean force'" >&2
+            exit 1
+        fi
+    fi
+
+    if [ -n "$bucket" ]; then
+        if aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
+            aws s3 rm "s3://$bucket" --recursive
+            aws s3api delete-bucket --bucket "$bucket"
+            echo "deleted s3://$bucket"
+        else
+            echo "s3://$bucket is already gone"
+        fi
+    fi
+
+    if [ -f "$env_file" ]; then
+        rm -f "$env_file"
+        echo "removed $env_file"
+    fi
