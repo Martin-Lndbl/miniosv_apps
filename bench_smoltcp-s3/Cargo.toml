@@ -1,0 +1,43 @@
+[package]
+name = "osv_app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[dependencies.smoltcp]
+version = "0.13.1"
+default-features = false
+features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-tcp",
+    "socket-dhcpv4",
+]
+
+# --- TLS stack -----------------------------------------------------------
+# rustls in no_std mode: no `std` feature, no default logging (we don't
+# have `log`), only tls12 for a smaller footprint.
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["tls12"]
+
+# Pure-Rust crypto provider so the build doesn't need ring/aws-lc-rs'
+# C+asm build environment. `alloc` enables the Box/Arc code paths.
+[dependencies.rustls-rustcrypto]
+version = "0.0.2-alpha"
+default-features = false
+features = ["alloc", "tls12"]
+
+# Compiled-in Mozilla root CA bundle for cert-chain verification.
+[dependencies.webpki-roots]
+version = "0.26"
