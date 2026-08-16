@@ -420,6 +420,9 @@ static SYN_RETRIES: AtomicU64 = AtomicU64::new(0);
 static TX_ALLOC_FAIL: AtomicU64 = AtomicU64::new(0);
 static TX_BURST_FAIL: AtomicU64 = AtomicU64::new(0);
 static SETUP_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Non-206 responses, and the first such code. 0 means none: not a status.
+static BAD_STATUS: AtomicU64 = AtomicU64::new(0);
+static FIRST_BAD_STATUS: AtomicU64 = AtomicU64::new(0);
 
 static N_WORKERS: AtomicU64 = AtomicU64::new(0);
 
@@ -919,6 +922,8 @@ struct Conn {
     // HTTP response header skipping, so `bytes_received` is body-only.
     headers_done: bool,
     hdr_state: u8,
+    status: u16,
+    status_pos: u8,
     // --- instrumentation ---
     // Total SYNs sent, and whether this connection has left SynSent yet
     // (either established or given up).
@@ -940,12 +945,21 @@ const FAULT_ABANDON_CONNS: usize = 0;
 /// far as TLS is concerned, so counting raw decrypted length overcounts by one
 /// header per connection and makes a byte-exact completeness check impossible.
 /// The CRLFCRLF terminator can straddle records, hence the carried state.
-fn count_body(bytes: &mut usize, headers_done: &mut bool, hdr_state: &mut u8, data: &[u8]) {
+fn count_body(bytes: &mut usize, headers_done: &mut bool, hdr_state: &mut u8,
+              status: &mut u16, status_pos: &mut u8, data: &[u8]) {
     if *headers_done {
         *bytes += data.len();
         return;
     }
     for (i, &b) in data.iter().enumerate() {
+        // "HTTP/1.1 206 ..." — the code is bytes 9..12. An error body counts
+        // as bytes, so a refusal otherwise looks like a shortfall.
+        if *status_pos < 12 {
+            if *status_pos >= 9 && b.is_ascii_digit() {
+                *status = *status * 10 + (b - b'0') as u16;
+            }
+            *status_pos += 1;
+        }
         *hdr_state = match (*hdr_state, b) {
             (0, b'\r') => 1,
             (1, b'\n') => 2,
@@ -956,6 +970,12 @@ fn count_body(bytes: &mut usize, headers_done: &mut bool, hdr_state: &mut u8, da
         };
         if *hdr_state == 4 {
             *headers_done = true;
+            // The request is ranged, so only 206 is what we asked for.
+            if *status != 206 {
+                BAD_STATUS.fetch_add(1, Ordering::Relaxed);
+                FIRST_BAD_STATUS.compare_exchange(0, *status as u64,
+                    Ordering::Relaxed, Ordering::Relaxed).ok();
+            }
             *bytes += data.len() - (i + 1);
             return;
         }
@@ -1040,7 +1060,9 @@ fn conn_step(
                     match rec {
                         Ok(rec) => count_body(&mut conn.bytes_received,
                             &mut conn.headers_done,
-                            &mut conn.hdr_state, rec.payload),
+                            &mut conn.hdr_state,
+                            &mut conn.status,
+                            &mut conn.status_pos, rec.payload),
                         Err(e) => { println!("FAIL: tls record: {:?}", e); conn.done = true; break; }
                     }
                 }
@@ -1255,6 +1277,8 @@ extern "C" fn worker_thread(arg: *mut c_void) {
             closed_cleanly: false,
             headers_done: false,
             hdr_state: 0,
+            status: 0,
+            status_pos: 0,
             attempts: 1,
             settled: false,
             start_ms: clk.elapsed_ms(),
@@ -1488,6 +1512,17 @@ pub extern "C" fn osv_app_main() {
     println!("connections   : {}/{} closed cleanly, {} failed", conns_clean, conns_total, failed);
     println!("syn retries   : {} (expected 0)", retries);
     println!("misrouted rx  : {} packets dropped (expected 0)", misrouted);
+    let bad = BAD_STATUS.load(Ordering::Relaxed);
+    let first_bad = FIRST_BAD_STATUS.load(Ordering::Relaxed);
+    println!("http status   : {} non-206 responses (expected 0){}", bad,
+        if bad > 0 {
+            // Without naming it, throttling reads as lost bytes.
+            if first_bad == 503 { " — 503 SlowDown, S3 is throttling" }
+            else { " — see first code below" }
+        } else { "" });
+    if bad > 0 {
+        println!("first bad code: {}", first_bad);
+    }
     println!("tx drops      : {} no-mbuf, {} ring-full (expected 0)",
         TX_ALLOC_FAIL.load(Ordering::Relaxed), TX_BURST_FAIL.load(Ordering::Relaxed));
 
