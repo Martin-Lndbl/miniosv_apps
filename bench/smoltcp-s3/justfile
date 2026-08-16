@@ -57,6 +57,9 @@ setup:
     # Held fixed while workers vary: bytes moved = workers x conns x block, so
     # a throughput-vs-parallelism curve is not also a request-size curve.
     block=$(ask "bytes per request (block size)" "${BENCH_BLOCK_SIZE:-64M}")
+    # A sweep runs for hours, so it can report each run to an ntfy-style
+    # endpoint. Empty disables it; nothing is sent and nothing fails.
+    push_url=$(ask "push url for run notifications (blank for none)" "${BENCH_PUSH_URL:-}")
 
     if [ "$bucket" = "create" ] || [ -z "$bucket" ]; then
         bucket="miniosv-bench-$(date +%s)"
@@ -167,6 +170,7 @@ setup:
         printf 'BENCH_CONNS_PER_WORKER="%s"\n' "$conns"
         printf 'BENCH_TLS_STUB="%s"\n' "$tls_stub"
         printf 'BENCH_BLOCK_SIZE="%s"\n' "$block"
+        printf 'BENCH_PUSH_URL="%s"\n' "$push_url"
     } > "$env_file"
 
     echo "wrote $env_file — reload the devshell to pick it up (direnv does it for you)"
