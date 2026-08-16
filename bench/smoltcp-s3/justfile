@@ -121,8 +121,27 @@ setup:
     fi
 
     echo "granting $vpce read on s3://$bucket/{{ blob }}"
-    policy=$(printf '{"Version":"2012-10-17","Statement":[{"Sid":"BenchBlobFromVpce","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/%s","Condition":{"StringEquals":{"aws:sourceVpce":"%s"}}}]}' \
-        "$bucket" "{{ blob }}" "$vpce")
+    # Merged by Sid, not written wholesale: this bucket also carries the
+    # grant competitors/linux-s3 installs for its binary under bin/, and
+    # overwriting it surfaced as a 404 on an instance that was already billing.
+    current=$(aws s3api get-bucket-policy --bucket "$bucket" \
+        --query Policy --output text 2>/dev/null || echo '')
+    policy=$(python3 - "$bucket" "{{ blob }}" "$vpce" "$current" <<'PY'
+    import json, sys
+    bucket, blob, vpce, current = sys.argv[1:5]
+    ours = {
+        "Sid": "BenchBlobFromVpce", "Effect": "Allow", "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:::{bucket}/{blob}",
+        "Condition": {"StringEquals": {"aws:sourceVpce": vpce}},
+    }
+    doc = (json.loads(current) if current.strip()
+           else {"Version": "2012-10-17", "Statement": []})
+    doc["Statement"] = [s for s in doc.get("Statement", [])
+                        if s.get("Sid") != ours["Sid"]] + [ours]
+    print(json.dumps(doc))
+    PY
+    )
     aws s3api put-bucket-policy --bucket "$bucket" --policy "$policy"
 
     # The bench dials the bucket by address because the guest has no DNS.
