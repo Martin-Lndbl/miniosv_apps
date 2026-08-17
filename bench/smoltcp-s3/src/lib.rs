@@ -477,7 +477,15 @@ fn toeplitz(key: &[u8], data: &[u8]) -> u32 {
 
 /// Predicted RX queue for a 12-byte tuple in wire order. u16::MAX if the RSS
 /// configuration could not be read.
+static mut SINGLE_QUEUE: bool = false;
+
 fn predict_queue(tuple: &[u8; 12]) -> u16 {
+    // One queue receives everything, so there is nothing to predict. The PMD
+    // does not configure RSS for a single queue, so the key and table below
+    // would be unreadable anyway.
+    if unsafe { SINGLE_QUEUE } {
+        return 0;
+    }
     let (key_len, reta_len) = unsafe { (RSS_KEY_LEN, RSS_RETA_LEN) };
     if key_len == 0 || reta_len == 0 {
         return u16::MAX;
@@ -523,6 +531,12 @@ fn owns_port(bitmap: *const u8, port: u16) -> bool {
 
 /// Read the key and indirection table the device is actually using.
 fn load_rss_config(n_queues: u16) -> bool {
+    if n_queues == 1 {
+        unsafe { SINGLE_QUEUE = true };
+        // Same shape as below: the harness reads worker count off this line.
+        println!("rss: {} queues, steering is trivial", n_queues);
+        return true;
+    }
     let mut key = [0u8; 64];
     let klen = unsafe { shim_rss_hash_key(0, key.as_mut_ptr(), key.len() as u16) };
     if klen <= 0 {
