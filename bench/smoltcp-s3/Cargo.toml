@@ -41,3 +41,10 @@ features = ["alloc", "tls12"]
 # Compiled-in Mozilla root CA bundle for cert-chain verification.
 [dependencies.webpki-roots]
 version = "0.26"
+
+# Vendored to lower the TCP retransmission floor. smoltcp clamps the RTO to
+# RFC 6298's 1 s minimum, which is ~3000x the in-region S3 round trip, so a
+# single lost SYN cost a full second and dominated whole runs. See
+# vendor/smoltcp/src/socket/tcp.rs, marked LOCAL PATCH.
+[patch.crates-io]
+smoltcp = { path = "vendor/smoltcp" }
