@@ -1405,11 +1405,11 @@ pub extern "C" fn osv_app_main() {
     println!("target: {}.{}.{}.{}:{} {}", t[0], t[1], t[2], t[3], TARGET_PORT, TARGET_HOST);
     if t == [0, 0, 0, 0] {
         println!("FAIL: AWS_TARGET_IP is unset or malformed — run `just setup smoltcp-s3`");
-        loop { core::hint::spin_loop(); }
+        exit();
     }
     if OBJECT_SIZE == 0 || BLOCK_SIZE == 0 || CONNS_PER_WORKER == 0 || N_WORKERS_REQ == 0 {
         println!("FAIL: BENCH_WORKERS, BENCH_CONNS_PER_WORKER, BENCH_BLOCK_SIZE and AWS_BUCKET_SIZE must be nonzero");
-        loop { core::hint::spin_loop(); }
+        exit();
     }
 
     // Clamp to what the device advertises. ENA VFs cap io-queue count
@@ -1427,16 +1427,16 @@ pub extern "C" fn osv_app_main() {
 
     let (pools, mac) = probe_and_open(n_queues).unwrap_or_else(|| {
         println!("FAIL: no usable NIC");
-        loop { core::hint::spin_loop(); }
+        exit();
     });
 
     if !load_rss_config(n_queues) {
         println!("FAIL: cannot predict RSS steering without the key and table");
-        loop { core::hint::spin_loop(); }
+        exit();
     }
 
     let (ip, prefix_len, gw, gw_mac) = learn_network(pools[0].0, mac).unwrap_or_else(|| {
-        loop { core::hint::spin_loop(); }
+        exit();
     });
     let ip_bytes = ip.octets();
     let gw_bytes = gw.octets();
@@ -1585,6 +1585,10 @@ pub extern "C" fn osv_app_main() {
     }
 
     unsafe { shim_dev_stop(0) };
+    exit();
+}
+
+fn exit() -> ! {
     loop { core::hint::spin_loop(); }
 }
 
