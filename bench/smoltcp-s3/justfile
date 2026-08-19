@@ -54,6 +54,13 @@ setup:
     workers=$(ask "worker threads / rss queues" "${BENCH_WORKERS:-8}")
     conns=$(ask "connections per worker" "${BENCH_CONNS_PER_WORKER:-24}")
     tls_stub=$(ask "discard ciphertext instead of decrypting (0/1)" "${BENCH_TLS_STUB:-0}")
+    # http drops TLS entirely and dials port 80, which needs a bucket without an
+    # aws:SecureTransport deny — the policy written below does not add one.
+    scheme=$(ask "transport (https/http)" "${BENCH_SCHEME:-https}")
+    case "$scheme" in
+        http|https) ;;
+        *) echo "transport must be http or https, not '$scheme'" >&2; exit 1 ;;
+    esac
     # Held fixed while workers vary: bytes moved = workers x conns x block, so
     # a throughput-vs-parallelism curve is not also a request-size curve.
     block=$(ask "bytes per request (block size)" "${BENCH_BLOCK_SIZE:-64M}")
@@ -169,6 +176,7 @@ setup:
         printf 'BENCH_WORKERS="%s"\n' "$workers"
         printf 'BENCH_CONNS_PER_WORKER="%s"\n' "$conns"
         printf 'BENCH_TLS_STUB="%s"\n' "$tls_stub"
+        printf 'BENCH_SCHEME="%s"\n' "$scheme"
         printf 'BENCH_BLOCK_SIZE="%s"\n' "$block"
         printf 'BENCH_PUSH_URL="%s"\n' "$push_url"
     } > "$env_file"

@@ -351,6 +351,27 @@ const fn parse_bool(s: Option<&str>, default: bool) -> bool {
     }
 }
 
+const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] { return false; }
+        i += 1;
+    }
+    true
+}
+
+/// `BENCH_SCHEME`. Unset means https.
+const fn is_http(s: Option<&str>) -> bool {
+    let b = match s { Some(s) => s.as_bytes(), None => return false };
+    bytes_eq(b, b"http")
+}
+
+const fn scheme_ok(s: Option<&str>) -> bool {
+    let b = match s { Some(s) => s.as_bytes(), None => return true };
+    b.is_empty() || bytes_eq(b, b"http") || bytes_eq(b, b"https")
+}
+
 /// Dotted-quad, e.g. "3.5.216.240". Falls back to 0.0.0.0, which the caller
 /// treats as "not configured" and reports rather than silently misdialling.
 const fn parse_ipv4(s: Option<&str>) -> [u8; 4] {
@@ -396,10 +417,22 @@ const OBJECT_SIZE: u64 = parse_size(option_env!("AWS_BUCKET_SIZE"), 10 * 1024 * 
 /// throughput-vs-request-size curve: splitting a fixed total across workers
 /// shrank each request as parallelism rose and confounded the two.
 const BLOCK_SIZE: u64 = parse_size(option_env!("BENCH_BLOCK_SIZE"), 64 * 1024 * 1024);
+/// `BENCH_SCHEME=http` drops TLS entirely and dials port 80, which isolates the
+/// network stack from the record layer. Rows from the two schemes measure
+/// different things and do not belong in one CSV.
+const PLAIN_HTTP: bool = is_http(option_env!("BENCH_SCHEME"));
+/// A misspelt scheme would silently run TLS and produce a row labelled https,
+/// which is a wrong measurement rather than a failed one.
+const _: () = assert!(
+    scheme_ok(option_env!("BENCH_SCHEME")),
+    "BENCH_SCHEME must be http or https"
+);
 /// Discard ciphertext after the handshake instead of decrypting it. Isolates
 /// the network stack from the record layer; the transfer is then unverifiable
 /// byte-for-byte, so the completeness check falls back to a range check.
-const STUB_TLS_AFTER_HANDSHAKE: bool = parse_bool(option_env!("BENCH_TLS_STUB"), false);
+/// Meaningless without a record layer, so `PLAIN_HTTP` forces it off.
+const STUB_TLS_AFTER_HANDSHAKE: bool =
+    parse_bool(option_env!("BENCH_TLS_STUB"), false) && !PLAIN_HTTP;
 
 // ---------------------------------------------------------------------------
 // Counters. These are cheap and stay in the build: each one is an invariant
@@ -799,7 +832,7 @@ const _: () = assert!(
       && TARGET_IP_OCTETS[2] == 0 && TARGET_IP_OCTETS[3] == 0),
     "AWS_TARGET_IP is unset or malformed - run `just setup smoltcp-s3`"
 );
-const TARGET_PORT: u16 = 443;
+const TARGET_PORT: u16 = if PLAIN_HTTP { 80 } else { 443 };
 // Endpoint is baked in at build time from $AWS_BUCKET / $AWS_REGION
 // (see `just setup`).
 const TARGET_HOST: &str = concat!(
@@ -914,7 +947,8 @@ const TLS_BUF_CAP: usize = 256 * 1024;
 // through all `Conn`s each iteration until every one hits FIN.
 struct Conn {
     handle: smoltcp::iface::SocketHandle,
-    tls: UnbufferedClientConnection,
+    /// None under `PLAIN_HTTP`: no session to drive.
+    tls: Option<UnbufferedClientConnection>,
     incoming: Vec<u8>,
     outgoing: Vec<u8>,
     request: Vec<u8>,
@@ -1039,6 +1073,14 @@ fn conn_step(
         conn.done = true;
         return true;
     }
+    // No handshake to wait on, so the GET is queued as soon as the socket is
+    // open. `handshake_done` then means "the request may go out", which is
+    // what the clean-close check below reads it as.
+    if PLAIN_HTTP && !conn.request_queued && s.may_send() {
+        conn.outgoing.extend_from_slice(&conn.request);
+        conn.request_queued = true;
+        conn.handshake_done = true;
+    }
     if !conn.outgoing.is_empty() && s.can_send() {
         if let Ok(n) = s.send_slice(&conn.outgoing) {
             if n > 0 { conn.outgoing.drain(..n); }
@@ -1059,11 +1101,21 @@ fn conn_step(
         conn.incoming.clear();
     }
 
-    let mut progress = true;
+    // With no record layer the socket already holds body bytes.
+    if PLAIN_HTTP && !conn.incoming.is_empty() {
+        count_body(&mut conn.bytes_received, &mut conn.headers_done,
+            &mut conn.hdr_state, &mut conn.status, &mut conn.status_pos,
+            &conn.incoming);
+        conn.incoming.clear();
+    }
+
+    let mut progress = !PLAIN_HTTP;
     while progress {
         progress = false;
-        let UnbufferedStatus { discard, state: tls_state } =
-            conn.tls.process_tls_records(&mut conn.incoming);
+        let UnbufferedStatus { discard, state: tls_state } = match conn.tls.as_mut() {
+            Some(tls) => tls.process_tls_records(&mut conn.incoming),
+            None => break,
+        };
         let st = match tls_state {
             Ok(st) => st,
             Err(e) => { println!("FAIL: tls: {:?}", e); conn.done = true; break; }
@@ -1270,9 +1322,13 @@ extern "C" fn worker_thread(arg: *mut c_void) {
         }
         let mut request_buf = [0u8; 384];
         let n = build_range_request(&mut request_buf, start, end);
-        let tls = match UnbufferedClientConnection::new(cfg.clone(), server_name.clone()) {
-            Ok(c) => c,
-            Err(e) => { println!("FAIL: rustls new: {:?}", e); return; }
+        let tls = if PLAIN_HTTP {
+            None
+        } else {
+            match UnbufferedClientConnection::new(cfg.clone(), server_name.clone()) {
+                Ok(c) => Some(c),
+                Err(e) => { println!("FAIL: rustls new: {:?}", e); return; }
+            }
         };
         conns.push(Conn {
             handle: handles[i],
@@ -1413,9 +1469,9 @@ fn learn_network(
 pub extern "C" fn osv_app_main() {
 
     let t = TARGET_IP.octets();
-    println!("bench: {} workers x {} conns x {} MiB block, tls_stub={}",
+    println!("bench: {} workers x {} conns x {} MiB block, tls_stub={} scheme={}",
         N_WORKERS_REQ, CONNS_PER_WORKER, BLOCK_SIZE / (1024 * 1024),
-        STUB_TLS_AFTER_HANDSHAKE);
+        STUB_TLS_AFTER_HANDSHAKE, if PLAIN_HTTP { "http" } else { "https" });
     println!("target: {}.{}.{}.{}:{} {}", t[0], t[1], t[2], t[3], TARGET_PORT, TARGET_HOST);
     if t == [0, 0, 0, 0] {
         println!("FAIL: AWS_TARGET_IP is unset or malformed — run `just setup smoltcp-s3`");
