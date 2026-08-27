@@ -184,3 +184,16 @@ pub const TARGET_HOST: &str = concat!(
 );
 
 pub const TARGET_PATH: &str = "/blob.bin";
+
+/// `BENCH_MODE=net` runs the mininet selftest instead of the benchmark: the
+/// Service API, the parked-thread handoff and delivery into a buffer, none of
+/// which the benchmark itself touches. Anything else runs the benchmark.
+pub const SELFTEST: bool = is_net(option_env!("BENCH_MODE"));
+
+const fn is_net(s: Option<&str>) -> bool {
+    let b = match s {
+        Some(s) => s.as_bytes(),
+        None => return false,
+    };
+    bytes_eq(b, b"net")
+}

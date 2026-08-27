@@ -16,6 +16,7 @@ Nothing below drives a NIC.
 extern crate alloc;
 
 mod config;
+mod selftest;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -204,6 +205,9 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osv_app_main() {
+    if config::SELFTEST {
+        selftest::run();
+    }
     println!(
         "bench: {} workers x {} conns x {} MiB block, tls_stub={} scheme={}",
         N_WORKERS_REQ,

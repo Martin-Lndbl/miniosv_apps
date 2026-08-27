@@ -12,6 +12,7 @@ fn main() {
         "BENCH_TLS_STUB",
         "BENCH_SCHEME",
         "BENCH_BLOCK_SIZE",
+        "BENCH_MODE",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
