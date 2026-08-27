@@ -4,7 +4,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 # the devshell and the root justfile all read it from there.
 env_file := parent_directory(parent_directory(parent_directory(justfile_directory()))) / ".env"
 
-# Object the bench GETs — must match TARGET_PATH in src/lib.rs.
+# Object the bench GETs — must match TARGET_PATH in src/config.rs.
 blob := "blob.bin"
 
 # List available recipes
