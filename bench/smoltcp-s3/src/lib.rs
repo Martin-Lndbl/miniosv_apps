@@ -49,6 +49,9 @@ struct WorkerResult {
     /// Non-206 responses, and the first such code. 0 means none: not a status.
     bad_status: AtomicU64,
     first_bad_status: AtomicU64,
+    /// Responses whose parsed head did not describe the range that was asked
+    /// for. Validates the header parser against what S3 actually sends.
+    hdr_bad: AtomicU64,
 }
 
 fn build_range_request(buf: &mut [u8], start: u64, end_inclusive: u64) -> usize {
@@ -92,6 +95,9 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
     // ranges genuinely unrequested -- exactly the failure the completeness
     // check has to catch.
     let open = w.slots().saturating_sub(FAULT_ABANDON_CONNS);
+    // What each slot asked for, so the response head can be checked against
+    // it afterwards. `None` for a slot that never opened.
+    let mut asked: Vec<Option<(u64, u64)>> = alloc::vec![None; w.slots()];
     let mut expected: u64 = 0;
     for i in 0..open {
         let (start, end) = block_range(first_block + i as u64);
@@ -104,6 +110,7 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
         if w.connect(i, &req).is_err() {
             continue;
         }
+        asked[i] = Some((start, end));
         expected += end - start + 1;
     }
 
@@ -116,7 +123,12 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
     let mut clean = 0u64;
     let mut bad = 0u64;
     let mut first_bad = 0u64;
-    for c in w.conns() {
+    let mut hdr_bad = 0u64;
+    for slot in 0..w.slots() {
+        let c = match w.conn(slot) {
+            Some(c) => c,
+            None => continue,
+        };
         bytes += c.body_bytes();
         total += 1;
         if c.is_complete() {
@@ -133,11 +145,49 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
         }
         // The request is ranged, so only 206 is what we asked for. With the
         // record layer stubbed out there is no plaintext head to read, so
-        // there is no status to judge either.
-        if c.headers_parsed() && c.status() != 206 {
+        // there is no status to judge, and no headers either.
+        if !c.headers_parsed() {
+            continue;
+        }
+        if c.status() != 206 {
             bad += 1;
             if first_bad == 0 {
                 first_bad = c.status() as u64;
+            }
+        }
+        // Check the parsed head against what this slot actually requested.
+        // The parser is new and nothing else here reads it, so without this
+        // it would be exercised on every run and validated on none -- and a
+        // misparsed Content-Length is exactly the bug that would later hand
+        // DuckDB a short page without anything noticing.
+        if let Some((start, end)) = asked[slot] {
+            let want = end - start + 1;
+            let head = c.head();
+            let len_ok = head.content_length == Some(want);
+            let range_ok = head
+                .content_range
+                .map(|r| r.first == start && r.last == end && r.total == Some(OBJECT_SIZE))
+                .unwrap_or(false);
+            // S3 always sends one on a 206; its absence is a parse failure,
+            // not a server that chose not to.
+            let etag_ok = head.etag.is_some();
+            if !len_ok || !range_ok || !etag_ok {
+                hdr_bad += 1;
+                if hdr_bad == 1 {
+                    println!(
+                        "q{}: head mismatch on port {}: content-length {:?} (want {}), \
+                         content-range {:?} (want {}-{}/{}), etag {:?}",
+                        queue_id,
+                        c.src_port(),
+                        head.content_length,
+                        want,
+                        head.content_range,
+                        start,
+                        end,
+                        OBJECT_SIZE,
+                        head.etag
+                    );
+                }
             }
         }
     }
@@ -149,6 +199,7 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
     out.conns_clean.store(clean, Ordering::Relaxed);
     out.bad_status.store(bad, Ordering::Relaxed);
     out.first_bad_status.store(first_bad, Ordering::Relaxed);
+    out.hdr_bad.store(hdr_bad, Ordering::Relaxed);
 }
 
 #[unsafe(no_mangle)]
@@ -226,6 +277,7 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
     let mut conns_clean = 0u64;
     let mut bad = 0u64;
     let mut first_bad = 0u64;
+    let mut hdr_bad = 0u64;
 
     for (i, r) in results.iter().enumerate() {
         let b = r.bytes_received.load(Ordering::Relaxed);
@@ -235,6 +287,7 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         conns_total += r.conns_total.load(Ordering::Relaxed);
         conns_clean += r.conns_clean.load(Ordering::Relaxed);
         bad += r.bad_status.load(Ordering::Relaxed);
+        hdr_bad += r.hdr_bad.load(Ordering::Relaxed);
         if first_bad == 0 {
             first_bad = r.first_bad_status.load(Ordering::Relaxed);
         }
@@ -295,6 +348,15 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         println!("first bad code: {}", first_bad);
     }
     println!(
+        "response heads: {} did not match the range requested (expected 0){}",
+        hdr_bad,
+        if STUB_TLS_AFTER_HANDSHAKE {
+            " — not checked, the record layer is stubbed out"
+        } else {
+            ""
+        }
+    );
+    println!(
         "tx drops      : {} no-mbuf, {} ring-full (expected 0)",
         s.tx_alloc_fail, s.tx_burst_fail
     );
@@ -348,7 +410,7 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         total_b == total_expected
     };
 
-    if ranges_ok && covered && bytes_ok && s.misrouted_drops == 0 {
+    if ranges_ok && covered && bytes_ok && s.misrouted_drops == 0 && hdr_bad == 0 {
         if STUB_TLS_AFTER_HANDSHAKE {
             println!(
                 "COMPLETE: all {} blocks fetched (set BENCH_TLS_STUB=0 for a byte-exact check)",
@@ -367,8 +429,14 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
             } else {
                 total_expected - total_b
             },
-            if total_b > total_expected { "over" } else { "short" }
+            if total_b > total_expected { "over" } else { "short" },
         );
+        if hdr_bad > 0 {
+            println!(
+                "  and {} response head(s) did not describe the range requested",
+                hdr_bad
+            );
+        }
     }
 }
 
