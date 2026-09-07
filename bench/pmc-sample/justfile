@@ -1,0 +1,192 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+root := parent_directory(parent_directory(parent_directory(justfile_directory())))
+app := "apps/bench/pmc-sample"
+
+# List available recipes
+default:
+    @just --list
+
+# Writes nothing: the .env it would write to is shared with smoltcp-s3, and
+# clobbering it would cost someone their bucket. Knobs go on the make command
+# line instead (see the Makefile).
+
+# Check that this host can produce a meaningful run
+setup:
+    #!/usr/bin/env bash
+    set -uo pipefail
+
+    ok=0
+    warn() { echo "  WARN  $*"; ok=1; }
+    good() { echo "  ok    $*"; }
+
+    echo "pmc-sample setup check:"
+
+    if [ -w /dev/kvm ]; then
+        good "/dev/kvm is writable"
+    else
+        warn "/dev/kvm not writable -- run.py falls back to TCG, which emulates"
+        warn "      no PMU at all. Every counter would read zero."
+    fi
+
+    # Without this the MSRs exist but never count, which looks like a good run.
+    for p in /sys/module/kvm/parameters/enable_pmu /sys/module/kvm_amd/parameters/enable_pmu; do
+        if [ -r "$p" ]; then
+            v=$(cat "$p")
+            case "$v" in
+                Y|1|y) good "vPMU enabled ($p)" ;;
+                *)     warn "vPMU disabled ($p=$v) -- counters will read zero" ;;
+            esac
+        fi
+    done
+
+    if command -v qemu-system-x86_64 >/dev/null; then
+        good "qemu-system-x86_64 present"
+    else
+        warn "qemu-system-x86_64 not on PATH"
+    fi
+
+    gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)
+    case "$gov" in
+        performance) good "cpufreq governor is performance" ;;
+        unknown)     good "no cpufreq governor exposed (fine under a fixed-clock host)" ;;
+        *)           warn "cpufreq governor is '$gov' -- 'performance' gives steadier numbers" ;;
+    esac
+
+    echo
+    if [ "$ok" = 0 ]; then
+        echo "ready:  just build {{ app }} -j8 && just run"
+    else
+        echo "runnable, but read the warnings above before trusting the numbers"
+    fi
+
+# Build and run locally, saving the CSVs under results/pmc-sample/
+capture *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    out="{{ root }}/results/pmc-sample"
+    mkdir -p "$out"
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    log="$out/$stamp.log"
+
+    # PMC_POWEROFF=1 only here: the default ends in an endless loop so a
+    # deployed run keeps its console output, but a local capture has to return.
+    just --justfile "{{ root }}/justfile" --working-directory "{{ root }}" \
+        build {{ app }} -j8 PMC_POWEROFF=1
+    just --justfile "{{ root }}/justfile" --working-directory "{{ root }}" \
+        run {{ args }} | tee "$log"
+
+    # Drop the tag that let grep find each block, so what lands on disk is an
+    # ordinary CSV whose first column carries data.
+    tag() { grep -E "^#?$1," "$log" | cut -d, -f2- || true; }
+    tag SAMPLE > "$out/$stamp-sample.csv"
+    echo
+    echo "wrote $log"
+    echo "      $out/$stamp-sample.csv"
+
+# The guest stays up (the PMC_POWEROFF default), because a stopped instance
+# takes the serial console with it. So the run does not end by itself: this
+# watches the log and interrupts the deploy once the guest prints
+# 'pmc-sample: done', which is what aws-deploy.py's teardown hangs off — it then
+# terminates the instance and deletes the AMI and snapshot. Ctrl+C does the
+# same thing at any point. Billing runs until teardown, so it does not simply
+# wait out the deadline.
+#
+# A non-metal instance may report zero counters, the vPMU often not being
+# exposed there. The banner says which, before anything else runs.
+
+# Deploy to EC2 and capture the console (default c7i.large)
+deploy instance="c7i.large" deadline="900" *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    instance="{{ instance }}"
+    out="{{ root }}/results/pmc-sample"
+    mkdir -p "$out"
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    log="$out/$stamp-$instance.log"
+    : > "$log"
+
+    split_done=""
+    split() {
+        [ -n "$split_done" ] && return 0
+        split_done=1
+        # x86 instances reboot after the run and do the whole thing again, so
+        # the console holds several complete passes. Take the first, or the
+        # CSVs come out as N runs concatenated with N repeated headers.
+        # tr -d '\r': the serial console uses CRLF, which would otherwise ride
+        # along on the last field of every row.
+        run=$(tr -d '\r' < "$log" |
+              awk '/^pmc-sample: arch/ {n++} n==1 {print; if (/^pmc-sample: done/) exit}')
+        tag() { printf '%s\n' "$run" | grep -E "^#?$1," | cut -d, -f2- || true; }
+        tag SAMPLE > "$out/$stamp-$instance-sample.csv"
+        echo "wrote $log and its CSV"
+    }
+    trap split EXIT
+
+    # Graviton families (c7g, m7g, t4g, ...) are aarch64; everything else here
+    # is x86-64. aws-deploy.py picks the AMI architecture from the instance
+    # type, so the image it uploads has to match, and it takes build/last.
+    case "${instance%%.*}" in
+        *[0-9]g|*[0-9]gd|*[0-9]gn) arch=aarch64 ;;
+        *)                         arch=x64 ;;
+    esac
+    echo "building for $arch ($instance)"
+
+    just --justfile "{{ root }}/justfile" --working-directory "{{ root }}" \
+        build {{ app }} -j8 arch=$arch
+
+    # setsid puts the deploy in its own process group, so the interrupt below
+    # reaches aws-deploy.py itself rather than stopping at the `just` wrapper.
+    setsid just --justfile "{{ root }}/justfile" --working-directory "{{ root }}" \
+        deploy "$instance" {{ args }} > "$log" 2>&1 &
+    dep=$!
+    trap 'kill -INT -"$dep" 2>/dev/null || kill -INT "$dep" 2>/dev/null || true' INT
+
+    tail -f --pid="$dep" "$log" &
+    tailer=$!
+
+    for _ in $(seq 1 $(( {{ deadline }} / 2 )) ); do
+        grep -q '^pmc-sample: done' "$log" 2>/dev/null && break
+        kill -0 "$dep" 2>/dev/null || break
+        sleep 2
+    done
+
+    # Group first: teardown lives in aws-deploy.py, and skipping it leaves a
+    # running instance behind.
+    kill -INT -"$dep" 2>/dev/null || kill -INT "$dep" 2>/dev/null || true
+    wait "$dep" 2>/dev/null || true
+    kill "$tailer" 2>/dev/null || true
+
+# Remove this bench's build output and results ('force' skips the prompt)
+clean *force:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    targets=()
+    for o in "{{ root }}"/miniosv/build/*/app-objs/pmc-sample.*; do
+        [ -e "$o" ] && targets+=("$o")
+    done
+    [ -d "{{ root }}/results/pmc-sample" ] && targets+=("{{ root }}/results/pmc-sample")
+
+    if [ ${#targets[@]} -eq 0 ]; then
+        echo "nothing to clean up"
+        exit 0
+    fi
+
+    echo "about to delete:"
+    printf '  %s\n' "${targets[@]}"
+
+    if [ "{{ force }}" != "force" ]; then
+        if [ -t 0 ]; then
+            read -r -p "proceed? [y/N]: " answer || true
+            [ "${answer:-}" = "y" ] || { echo "aborted" >&2; exit 1; }
+        else
+            echo "refusing without a tty — use 'just clean force'" >&2
+            exit 1
+        fi
+    fi
+
+    rm -rf "${targets[@]}"
+    echo "removed ${#targets[@]} path(s)"
