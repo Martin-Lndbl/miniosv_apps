@@ -18,14 +18,23 @@ extern "C" void osv_app_main() {
   perf::enable_pmu();
   perf::PMCSelectCore pmcs{perf::make_default_core_pmcs()};
 
+  // The core clock, measured from the PMU's own cycle counter rather than
+  // assumed from the instance type. Nanoseconds alone are not comparable
+  // between a guest and bare metal: nothing manages P-states on metal, so the
+  // core can sit far below its rated clock, and a wall-clock figure then says
+  // as much about the frequency as about the operation. Recorded here so the
+  // plot can divide it out; on c5.metal an empty loop measured 2.00ns against
+  // 0.28ns in a guest, which is the symptom this exists to explain.
+  double hz = bench::cpu_hz();
+
   // Before anything can fail: on a virtualised instance the PMU may not be
   // exposed at all, and a run that dies then still has to say why. AWS slices
   // the count per VM -- c7i grants 8, c7a 5, both Gravitons 2.
   printf("pmc-cost: arch=%s vendor=%s pmu_counters=%u granted=%u reps=%d "
-         "budget_ms=%.0f\n",
+         "budget_ms=%.0f cpu_mhz=%.1f\n",
          bench::arch_name(), bench::vendor_name(), perf::pmu_num_counters(),
          static_cast<uint32_t>(pmcs.size_of_x(perf::PMClass::CORE)), PMC_REPS,
-         PMC_BUDGET_NS / 1e6);
+         PMC_BUDGET_NS / 1e6, hz / 1e6);
 
   perf::PMC *pmc = pmcs.acquire(perf::PMClass::CORE);
   if (!pmc) {
