@@ -1,0 +1,92 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+# .env is shared with apps/bench/smoltcp-s3: one bucket, one subnet, one VPC
+# gateway endpoint, because a mininet-backed image only ever dials one host
+# (see PLAN_duckdb_net.md §6, "One endpoint per image"). TPC-H data lands in
+# the same bucket, under its own prefix.
+env_file := parent_directory(parent_directory(parent_directory(justfile_directory()))) / ".env"
+smoltcp_s3 := justfile_directory() / ".." / "smoltcp-s3"
+
+# List available recipes
+default:
+    @just --list
+
+# Generate TPC-H at the given scale factor and upload it to
+# s3://$AWS_BUCKET/tpch/sf<N>/<table>.parquet, granted to the VPC gateway
+# endpoint under its own Sid so it doesn't clobber smoltcp-s3's grant.
+#
+#   just setup apps/bench/duckdb-tpch          # sf=1
+#   just setup apps/bench/duckdb-tpch 0.1      # smaller, faster to iterate on
+setup sf="1":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    env_file="{{ env_file }}"
+
+    # Bucket, region, subnet and target IP are smoltcp-s3's job; reuse them
+    # rather than re-deriving. First run here bootstraps them.
+    if [ ! -f "$env_file" ] || ! grep -q '^AWS_TARGET_IP=' "$env_file"; then
+        echo "no bucket/subnet/VPCE on record yet -- running smoltcp-s3's setup first"
+        just --justfile "{{ smoltcp_s3 }}/justfile" --working-directory "{{ smoltcp_s3 }}" setup
+    fi
+
+    set -a
+    . "$env_file"
+    set +a
+
+    bucket="${AWS_BUCKET:?no AWS_BUCKET in $env_file}"
+    region="${AWS_REGION:?no AWS_REGION in $env_file}"
+    sf="{{ sf }}"
+    prefix="tpch/sf${sf}"
+
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+
+    # A throwaway duckdb, not the miniOSv build: this one only has to run on
+    # the host and know the tpch extension. dbgen writes into an in-memory
+    # database; EXPORT DATABASE dumps every table as <table>.parquet.
+    echo "generating TPC-H sf=$sf..."
+    nix run nixpkgs#duckdb -- \
+        -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$sf); EXPORT DATABASE '$tmpdir' (FORMAT PARQUET);"
+
+    for table in customer lineitem nation orders part partsupp region supplier; do
+        echo "uploading $table.parquet"
+        aws s3 cp "$tmpdir/$table.parquet" "s3://$bucket/$prefix/$table.parquet" --only-show-errors
+    done
+
+    vpce=$(aws ec2 describe-vpc-endpoints \
+        --filters "Name=service-name,Values=com.amazonaws.$region.s3" \
+                  "Name=vpc-endpoint-type,Values=Gateway" \
+        --query "VpcEndpoints[0].VpcEndpointId" --output text)
+    if [ -z "$vpce" ] || [ "$vpce" = "None" ]; then
+        echo "no S3 gateway endpoint found in $region -- run smoltcp-s3's setup first" >&2
+        exit 1
+    fi
+
+    # Merged by Sid, same as smoltcp-s3's own grant: both read from this bucket.
+    AWS_BUCKET="$bucket" python3 "{{ justfile_directory() }}/../../../scripts/bucket_policy.py" \
+        add --sid "TpchSf${sf//./_}FromVpce" --vpce "$vpce" \
+        --resource "arn:aws:s3:::$bucket/$prefix/*"
+
+    echo
+    echo "tpch sf=$sf ready:"
+    echo "  s3://$bucket/$prefix/<table>.parquet"
+    echo "  https://$bucket.s3.$region.amazonaws.com/$prefix/<table>.parquet"
+
+# Remove one scale factor's objects and its bucket-policy grant (not the bucket itself)
+clean sf="1":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    env_file="{{ env_file }}"
+    [ -f "$env_file" ] || { echo "nothing to clean"; exit 0; }
+    set -a
+    . "$env_file"
+    set +a
+
+    sf="{{ sf }}"
+    bucket="${AWS_BUCKET:?no AWS_BUCKET in $env_file}"
+
+    aws s3 rm "s3://$bucket/tpch/sf${sf}/" --recursive
+    AWS_BUCKET="$bucket" python3 "{{ justfile_directory() }}/../../../scripts/bucket_policy.py" \
+        remove --sid "TpchSf${sf//./_}FromVpce"
