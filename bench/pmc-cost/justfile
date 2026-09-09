@@ -191,10 +191,8 @@ clean *force:
     rm -rf "${targets[@]}"
     echo "removed ${#targets[@]} path(s)"
 
-# Rerun the whole experiment and replot it.
-#
-#     just --justfile apps/bench/pmc-cost/justfile reproduce
-#     just --justfile apps/bench/pmc-cost/justfile reproduce 5 "c7i.large c8g.large"
+# Rerun the whole experiment and replot it. Normally reached via the
+# controller repo's `just reproduce pmc-cost`, not directly.
 #
 # Strictly serial. Concurrent deploys share miniosv/build/last, so two at once
 # will boot each other's image -- that happened once and cost a whole batch.
