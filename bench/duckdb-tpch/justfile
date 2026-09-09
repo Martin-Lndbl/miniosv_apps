@@ -11,13 +11,15 @@ smoltcp_s3 := justfile_directory() / ".." / "smoltcp-s3"
 default:
     @just --list
 
-# Generate TPC-H at the given scale factor and upload it to
+# Generate TPC-H at one or more scale factors and upload each to
 # s3://$AWS_BUCKET/tpch/sf<N>/<table>.parquet, granted to the VPC gateway
-# endpoint under its own Sid so it doesn't clobber smoltcp-s3's grant.
+# endpoint under its own Sid per scale factor so none of them, or
+# smoltcp-s3's own grant, clobber each other.
 #
 #   just setup apps/bench/duckdb-tpch          # sf=1
 #   just setup apps/bench/duckdb-tpch 0.1      # smaller, faster to iterate on
-setup sf="1":
+#   just setup apps/bench/duckdb-tpch 1,0.1,0.01   # all three, one call
+setup sfs="1":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -36,23 +38,6 @@ setup sf="1":
 
     bucket="${AWS_BUCKET:?no AWS_BUCKET in $env_file}"
     region="${AWS_REGION:?no AWS_REGION in $env_file}"
-    sf="{{ sf }}"
-    prefix="tpch/sf${sf}"
-
-    tmpdir=$(mktemp -d)
-    trap 'rm -rf "$tmpdir"' EXIT
-
-    # A throwaway duckdb, not the miniOSv build: this one only has to run on
-    # the host and know the tpch extension. dbgen writes into an in-memory
-    # database; EXPORT DATABASE dumps every table as <table>.parquet.
-    echo "generating TPC-H sf=$sf..."
-    nix run nixpkgs#duckdb -- \
-        -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$sf); EXPORT DATABASE '$tmpdir' (FORMAT PARQUET);"
-
-    for table in customer lineitem nation orders part partsupp region supplier; do
-        echo "uploading $table.parquet"
-        aws s3 cp "$tmpdir/$table.parquet" "s3://$bucket/$prefix/$table.parquet" --only-show-errors
-    done
 
     vpce=$(aws ec2 describe-vpc-endpoints \
         --filters "Name=service-name,Values=com.amazonaws.$region.s3" \
@@ -63,18 +48,44 @@ setup sf="1":
         exit 1
     fi
 
-    # Merged by Sid, same as smoltcp-s3's own grant: both read from this bucket.
-    AWS_BUCKET="$bucket" python3 "{{ justfile_directory() }}/../../../scripts/bucket_policy.py" \
-        add --sid "TpchSf${sf//./_}FromVpce" --vpce "$vpce" \
-        --resource "arn:aws:s3:::$bucket/$prefix/*"
+    IFS=',' read -ra sf_list <<< "{{ sfs }}"
+    for sf in "${sf_list[@]}"; do
+        prefix="tpch/sf${sf}"
 
-    echo
-    echo "tpch sf=$sf ready:"
-    echo "  s3://$bucket/$prefix/<table>.parquet"
-    echo "  https://$bucket.s3.$region.amazonaws.com/$prefix/<table>.parquet"
+        tmpdir=$(mktemp -d)
+        trap 'rm -rf "$tmpdir"' EXIT
 
-# Remove one scale factor's objects and its bucket-policy grant (not the bucket itself)
-clean sf="1":
+        # A throwaway duckdb, not the miniOSv build: this one only has to run
+        # on the host and know the tpch extension. dbgen writes into an
+        # in-memory database; EXPORT DATABASE dumps every table as
+        # <table>.parquet.
+        echo "generating TPC-H sf=$sf..."
+        nix run nixpkgs#duckdb -- \
+            -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$sf); EXPORT DATABASE '$tmpdir' (FORMAT PARQUET);"
+
+        for table in customer lineitem nation orders part partsupp region supplier; do
+            echo "uploading $table.parquet"
+            aws s3 cp "$tmpdir/$table.parquet" "s3://$bucket/$prefix/$table.parquet" --only-show-errors
+        done
+        rm -rf "$tmpdir"
+        trap - EXIT
+
+        # Merged by Sid, same as smoltcp-s3's own grant: both read from this
+        # bucket, and a second scale factor's grant doesn't touch the first's.
+        AWS_BUCKET="$bucket" python3 "{{ justfile_directory() }}/../../../scripts/bucket_policy.py" \
+            add --sid "TpchSf${sf//./_}FromVpce" --vpce "$vpce" \
+            --resource "arn:aws:s3:::$bucket/$prefix/*"
+
+        echo
+        echo "tpch sf=$sf ready:"
+        echo "  s3://$bucket/$prefix/<table>.parquet"
+        echo "  https://$bucket.s3.$region.amazonaws.com/$prefix/<table>.parquet"
+        echo
+    done
+
+# Remove one or more scale factors' objects and bucket-policy grants (not the bucket itself)
+#   just clean apps/bench/duckdb-tpch 0.1,0.01
+clean sfs="1":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -84,9 +95,11 @@ clean sf="1":
     . "$env_file"
     set +a
 
-    sf="{{ sf }}"
     bucket="${AWS_BUCKET:?no AWS_BUCKET in $env_file}"
 
-    aws s3 rm "s3://$bucket/tpch/sf${sf}/" --recursive
-    AWS_BUCKET="$bucket" python3 "{{ justfile_directory() }}/../../../scripts/bucket_policy.py" \
-        remove --sid "TpchSf${sf//./_}FromVpce"
+    IFS=',' read -ra sf_list <<< "{{ sfs }}"
+    for sf in "${sf_list[@]}"; do
+        aws s3 rm "s3://$bucket/tpch/sf${sf}/" --recursive
+        AWS_BUCKET="$bucket" python3 "{{ justfile_directory() }}/../../../scripts/bucket_policy.py" \
+            remove --sid "TpchSf${sf//./_}FromVpce"
+    done
