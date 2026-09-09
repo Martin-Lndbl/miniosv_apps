@@ -210,4 +210,6 @@ reproduce boots="3" machines="c7i.large c7a.large c7g.large":
         done
     done
     just --justfile "{{ root }}/justfile" --working-directory "{{ root }}" \
-        plot talk
+        reproduce pmc-primitives
+    just --justfile "{{ root }}/justfile" --working-directory "{{ root }}" \
+        reproduce pmc-metal
