@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <osv/perf.hh>
+#include <osv/sched.hh>
 
 #include "config.hh"
 

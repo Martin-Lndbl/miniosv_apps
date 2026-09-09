@@ -9,12 +9,17 @@
 #include <cstdio>
 
 #include <osv/perf.hh>
+#include <osv/sched.hh>
 
 #include "config.hh"
 
 #include "bench.hh"
 
 extern "C" void osv_app_main() {
+  // A PMC belongs to a core, so PMCSelect::acquire() refuses a thread that
+  // could migrate. Any cpu will do; what matters is that it stops changing.
+  sched::thread::pin(sched::cpu::current());
+
   perf::enable_pmu();
   perf::PMCSelectCore pmcs{perf::make_default_core_pmcs()};
 
@@ -68,11 +73,12 @@ extern "C" void osv_app_main() {
   // implementation -- without it the loop folds away and the floor reads zero.
   row("loop_overhead", [&](uint64_t) { asm volatile("" : "+r"(acc)); });
 
+  const perf::PMClass cls = pmc->pmClass;
   row("pmc_start_with_conf",
-      [&](uint64_t) { perf::pmc_start_with_conf(ctr, sel, bitmap); });
-  row("pmc_read", [&](uint64_t) { acc += perf::pmc_read(ctr); });
-  row("pmc_write", [&](uint64_t i) { perf::pmc_write_counter(ctr, i); });
-  row("pmc_stop", [&](uint64_t) { perf::pmc_stop(sel); });
+      [&](uint64_t) { perf::pmc_start_with_conf(ctr, sel, cls, bitmap); });
+  row("pmc_read", [&](uint64_t) { acc += perf::pmc_read(ctr, cls); });
+  row("pmc_write", [&](uint64_t i) { perf::pmc_write_counter(ctr, cls, i); });
+  row("pmc_stop", [&](uint64_t) { perf::pmc_stop(sel, cls); });
 
   bench::sink = acc;
   pmcs.release(pmc);

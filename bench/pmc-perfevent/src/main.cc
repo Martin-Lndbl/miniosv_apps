@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <osv/perf.hh>
+#include <osv/sched.hh>
 
 #include "config.hh"
 
@@ -41,6 +42,10 @@ void register_n(perf::PerfEvent &e, int n) {
 } // namespace
 
 extern "C" void osv_app_main() {
+  // A PMC belongs to a core, so PMCSelect::acquire() refuses a thread that
+  // could migrate. Any cpu will do; what matters is that it stops changing.
+  sched::thread::pin(sched::cpu::current());
+
   perf::enable_pmu();
 
   perf::PMCSelectCore probe{perf::make_default_core_pmcs()};
