@@ -76,25 +76,8 @@ double workload_ns(uint64_t period, uint64_t iters, uint64_t &samples) {
     samples = 0;
     return 0;
   }
-  // Once, right after the first arm. On aarch64 the overflow interrupt can
-  // fail three indistinguishable ways -- registered on an id the GIC never
-  // raises, never armed, or armed on a counter that is not running -- and the
-  // only visible symptom is a flood of unhandled irq=23. These are the three
-  // registers that tell them apart, read back from the hardware rather than
-  // assumed from what we wrote.
-  static bool once = false;
-  if (!once) {
-    once = true;
-    perf::PMCIntDebug d = perf::pmc_int_debug();
-    printf("pmc-sample: irq_id=%u intenset=0x%llx ovsclr=0x%llx "
-           "cntenset=0x%llx ctr=%u\n",
-           d.irq_id, (unsigned long long)d.intenset,
-           (unsigned long long)d.ovsclr, (unsigned long long)d.cntenset,
-           sampler.counter_id());
-  }
-  // Zeroed here rather than before start(): the debug printf above goes to the
-  // serial console, which is slow enough at 50 kHz to contribute thousands of
-  // overflows to a window it is not part of.
+  // Zeroed after start(), not before: anything between the two would be
+  // counted into a window it is not part of.
   sample_count = 0;
   bench::Cost c = bench::time_loop(iters, body);
   sampler.stop();
@@ -112,6 +95,14 @@ extern "C" void osv_app_main() {
   // console output at all while pmc-cost on the same image path was fine.
   // The last line printed says how far it got.
   printf("pmc-sample: start arch=%s\n", bench::arch_name());
+
+  // PMCSampler refuses to arm on a thread that could move. Under QEMU the app
+  // thread arrives pinned already, but that is the scheduler's choice and not
+  // a promise, so pin explicitly and report what it was on entry.
+  bool was_pinned = sched::thread::current()->pinned();
+  sched::thread::pin(sched::cpu::current());
+  printf("pmc-sample: cpu=%u pinned_on_entry=%d\n", sched::cpu::current()->id,
+         was_pinned);
 
   perf::enable_pmu();
   printf("pmc-sample: pmu enabled\n");
