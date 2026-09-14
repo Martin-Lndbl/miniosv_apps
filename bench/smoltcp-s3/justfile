@@ -38,16 +38,7 @@ setup with_blob="1":
         printf '%s' "${answer:-$default}"
     }
 
-    # Only this bench reads the blob, so a caller bootstrapping the bucket for
-    # its own data (just setup apps/bench/duckdb-tpch) passes with_blob=0 and
-    # is not asked about, or charged for, ten gigabytes it will never read.
-    if [ "{{ with_blob }}" = "1" ]; then
-        size=$(ask "blob size" "${AWS_BUCKET_SIZE:-10G}")
-    else
-        size="${AWS_BUCKET_SIZE:-10G}"
-    fi
-    bytes=$(numfmt --from=iec "$size" 2>/dev/null) \
-        || { echo "bad size: $size (try 10G)" >&2; exit 1; }
+    size="${AWS_BUCKET_SIZE:-10G}"
 
     region_default="${AWS_REGION:-$(aws configure get region 2>/dev/null || true)}"
     region=$(ask "aws region" "${region_default:-eu-north-1}")
@@ -55,24 +46,45 @@ setup with_blob="1":
 
     bucket=$(ask "s3 bucket (type 'create' for a new one)" "${AWS_BUCKET:-create}")
 
-    # Bench shape. Workers are clamped at run time to the RSS queue count the
-    # NIC advertises, which is where the useful parallelism ceiling actually
-    # comes from (c7i.8xlarge caps at 8, for instance).
-    workers=$(ask "worker threads / rss queues" "${BENCH_WORKERS:-8}")
-    conns=$(ask "connections per worker" "${BENCH_CONNS_PER_WORKER:-24}")
-    tls_stub=$(ask "discard ciphertext instead of decrypting (0/1)" "${BENCH_TLS_STUB:-0}")
-    # http drops TLS entirely and dials port 80, which needs a bucket without an
-    # aws:SecureTransport deny — the policy written below does not add one.
-    scheme=$(ask "transport (https/http)" "${BENCH_SCHEME:-https}")
+    # The blob and the shape it is read with belong to this bench and to
+    # competitors/linux-s3; nothing else reads BENCH_WORKERS, BENCH_BLOCK_SIZE,
+    # BENCH_SCHEME or BENCH_TLS_STUB. So with_blob=0 -- a caller provisioning
+    # the bucket for its own data -- is asked none of them. Discarding
+    # ciphertext instead of decrypting it is the clearest case: it measures the
+    # stack without a record layer, which is meaningless as soon as something
+    # actually has to parse the bytes. The defaults are still written, so
+    # running this setup properly later needs no second round of questions.
+    workers="${BENCH_WORKERS:-8}"
+    conns="${BENCH_CONNS_PER_WORKER:-24}"
+    tls_stub="${BENCH_TLS_STUB:-0}"
+    scheme="${BENCH_SCHEME:-https}"
+    if [ "{{ with_blob }}" = "1" ]; then
+        # Workers are clamped at run time to the RSS queue count the NIC
+        # advertises, which is where the useful parallelism ceiling actually
+        # comes from (c7i.8xlarge caps at 8, for instance).
+        size=$(ask "blob size" "$size")
+        workers=$(ask "worker threads / rss queues" "$workers")
+        conns=$(ask "connections per worker" "$conns")
+        tls_stub=$(ask "discard ciphertext instead of decrypting (0/1)" "$tls_stub")
+        # http drops TLS entirely and dials port 80, which needs a bucket
+        # without an aws:SecureTransport deny — the policy written below does
+        # not add one.
+        scheme=$(ask "transport (https/http)" "$scheme")
+    fi
+    bytes=$(numfmt --from=iec "$size" 2>/dev/null) \
+        || { echo "bad size: $size (try 10G)" >&2; exit 1; }
     case "$scheme" in
         http|https) ;;
         *) echo "transport must be http or https, not '$scheme'" >&2; exit 1 ;;
     esac
-    # Held fixed while workers vary: bytes moved = workers x conns x block, so
-    # a throughput-vs-parallelism curve is not also a request-size curve.
-    block=$(ask "bytes per request (block size)" "${BENCH_BLOCK_SIZE:-64M}")
-    # A sweep runs for hours, so it can report each run to an ntfy-style
-    # endpoint. Empty disables it; nothing is sent and nothing fails.
+    block="${BENCH_BLOCK_SIZE:-64M}"
+    if [ "{{ with_blob }}" = "1" ]; then
+        # Held fixed while workers vary: bytes moved = workers x conns x block,
+        # so a throughput-vs-parallelism curve is not also a request-size curve.
+        block=$(ask "bytes per request (block size)" "$block")
+    fi
+    # Asked either way: scripts/bench/runner.py reports every bench's runs to
+    # it, not just this one's. Empty disables it; nothing is sent, nothing fails.
     push_url=$(ask "push url for run notifications (blank for none)" "${BENCH_PUSH_URL:-}")
 
     if [ "$bucket" = "create" ] || [ -z "$bucket" ]; then
