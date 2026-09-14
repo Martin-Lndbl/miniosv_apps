@@ -12,7 +12,7 @@ default:
     @just --list
 
 # Probe the local environment, then write the answers to .env
-setup:
+setup with_blob="1":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -38,7 +38,14 @@ setup:
         printf '%s' "${answer:-$default}"
     }
 
-    size=$(ask "blob size" "${AWS_BUCKET_SIZE:-10G}")
+    # Only this bench reads the blob, so a caller bootstrapping the bucket for
+    # its own data (just setup apps/bench/duckdb-tpch) passes with_blob=0 and
+    # is not asked about, or charged for, ten gigabytes it will never read.
+    if [ "{{ with_blob }}" = "1" ]; then
+        size=$(ask "blob size" "${AWS_BUCKET_SIZE:-10G}")
+    else
+        size="${AWS_BUCKET_SIZE:-10G}"
+    fi
     bytes=$(numfmt --from=iec "$size" 2>/dev/null) \
         || { echo "bad size: $size (try 10G)" >&2; exit 1; }
 
@@ -85,14 +92,16 @@ setup:
 
     # The blob is checked every run: an existing bucket may have lost it, or
     # AWS_BUCKET_SIZE may have changed since it was uploaded.
-    have=$(aws s3api head-object --bucket "$bucket" --key "{{ blob }}" \
-        --query ContentLength --output text 2>/dev/null || true)
-    if [ "$have" = "$bytes" ]; then
-        echo "s3://$bucket/{{ blob }} is already $size"
-    else
-        echo "uploading $size to s3://$bucket/{{ blob }}"
-        head -c "$bytes" /dev/urandom \
-            | aws s3 cp - "s3://$bucket/{{ blob }}" --expected-size "$bytes"
+    if [ "{{ with_blob }}" = "1" ]; then
+        have=$(aws s3api head-object --bucket "$bucket" --key "{{ blob }}" \
+            --query ContentLength --output text 2>/dev/null || true)
+        if [ "$have" = "$bytes" ]; then
+            echo "s3://$bucket/{{ blob }} is already $size"
+        else
+            echo "uploading $size to s3://$bucket/{{ blob }}"
+            head -c "$bytes" /dev/urandom \
+                | aws s3 cp - "s3://$bucket/{{ blob }}" --expected-size "$bytes"
+        fi
     fi
 
     # The bench GETs the blob unsigned, so the bucket stays private and the
@@ -118,7 +127,9 @@ setup:
 
     # Merged by Sid, not written wholesale: this bucket also carries the grant
     # competitors/linux-s3 installs for its binary under bin/.
-    AWS_BUCKET="$bucket" bench_grant BenchBlobFromVpce "arn:aws:s3:::$bucket/{{ blob }}"
+    if [ "{{ with_blob }}" = "1" ]; then
+        AWS_BUCKET="$bucket" bench_grant BenchBlobFromVpce "arn:aws:s3:::$bucket/{{ blob }}"
+    fi
 
     # The bench dials the bucket by address because the guest has no DNS.
     # Resolving here keeps that constant tied to the bucket and region actually
