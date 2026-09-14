@@ -1,11 +1,13 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# .env is shared with apps/bench/smoltcp-s3: one bucket, one subnet, one VPC
-# gateway endpoint, because a mininet-backed image only ever dials one host
-# (see PLAN_duckdb_net.md §6, "One endpoint per image"). TPC-H data lands in
-# the same bucket, under its own prefix.
-env_file := parent_directory(parent_directory(parent_directory(justfile_directory()))) / ".env"
-smoltcp_s3 := justfile_directory() / ".." / "smoltcp-s3"
+# The bucket, the subnet and the VPC gateway endpoint are smoltcp-s3's, not
+# this bench's: a mininet-backed image only ever dials one host (see
+# PLAN_duckdb_net.md §6, "One endpoint per image"), so TPC-H data goes in the
+# same bucket under its own prefix. scripts/bench-setup.sh owns loading that
+# .env, logging in and granting the endpoint a read; what is left here is the
+# part only this bench knows -- which scale factors to generate and where to
+# put them.
+common := justfile_directory() / "../../../scripts/bench-setup.sh"
 
 # List available recipes
 default:
@@ -23,30 +25,9 @@ setup sfs="1":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    env_file="{{ env_file }}"
-
-    # Bucket, region, subnet and target IP are smoltcp-s3's job; reuse them
-    # rather than re-deriving. First run here bootstraps them.
-    if [ ! -f "$env_file" ] || ! grep -q '^AWS_TARGET_IP=' "$env_file"; then
-        echo "no bucket/subnet/VPCE on record yet -- running smoltcp-s3's setup first"
-        just --justfile "{{ smoltcp_s3 }}/justfile" --working-directory "{{ smoltcp_s3 }}" setup
-    fi
-
-    set -a
-    . "$env_file"
-    set +a
-
-    bucket="${AWS_BUCKET:?no AWS_BUCKET in $env_file}"
-    region="${AWS_REGION:?no AWS_REGION in $env_file}"
-
-    vpce=$(aws ec2 describe-vpc-endpoints \
-        --filters "Name=service-name,Values=com.amazonaws.$region.s3" \
-                  "Name=vpc-endpoint-type,Values=Gateway" \
-        --query "VpcEndpoints[0].VpcEndpointId" --output text)
-    if [ -z "$vpce" ] || [ "$vpce" = "None" ]; then
-        echo "no S3 gateway endpoint found in $region -- run smoltcp-s3's setup first" >&2
-        exit 1
-    fi
+    . "{{ common }}"
+    bench_env_load bootstrap
+    bench_login
 
     IFS=',' read -ra sf_list <<< "{{ sfs }}"
     for sf in "${sf_list[@]}"; do
@@ -65,21 +46,19 @@ setup sfs="1":
 
         for table in customer lineitem nation orders part partsupp region supplier; do
             echo "uploading $table.parquet"
-            aws s3 cp "$tmpdir/$table.parquet" "s3://$bucket/$prefix/$table.parquet" --only-show-errors
+            aws s3 cp "$tmpdir/$table.parquet" "s3://$AWS_BUCKET/$prefix/$table.parquet" --only-show-errors
         done
         rm -rf "$tmpdir"
         trap - EXIT
 
         # Merged by Sid, same as smoltcp-s3's own grant: both read from this
         # bucket, and a second scale factor's grant doesn't touch the first's.
-        AWS_BUCKET="$bucket" python3 "{{ justfile_directory() }}/../../../scripts/bucket_policy.py" \
-            add --sid "TpchSf${sf//./_}FromVpce" --vpce "$vpce" \
-            --resource "arn:aws:s3:::$bucket/$prefix/*"
+        bench_grant "TpchSf${sf//./_}FromVpce" "arn:aws:s3:::$AWS_BUCKET/$prefix/*"
 
         echo
         echo "tpch sf=$sf ready:"
-        echo "  s3://$bucket/$prefix/<table>.parquet"
-        echo "  https://$bucket.s3.$region.amazonaws.com/$prefix/<table>.parquet"
+        echo "  s3://$AWS_BUCKET/$prefix/<table>.parquet"
+        echo "  https://$AWS_BUCKET.s3.$AWS_REGION.amazonaws.com/$prefix/<table>.parquet"
         echo
     done
 
@@ -89,17 +68,11 @@ clean sfs="1":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    env_file="{{ env_file }}"
-    [ -f "$env_file" ] || { echo "nothing to clean"; exit 0; }
-    set -a
-    . "$env_file"
-    set +a
-
-    bucket="${AWS_BUCKET:?no AWS_BUCKET in $env_file}"
+    . "{{ common }}"
+    bench_env_load
 
     IFS=',' read -ra sf_list <<< "{{ sfs }}"
     for sf in "${sf_list[@]}"; do
-        aws s3 rm "s3://$bucket/tpch/sf${sf}/" --recursive
-        AWS_BUCKET="$bucket" python3 "{{ justfile_directory() }}/../../../scripts/bucket_policy.py" \
-            remove --sid "TpchSf${sf//./_}FromVpce"
+        aws s3 rm "s3://$AWS_BUCKET/tpch/sf${sf}/" --recursive
+        bench_revoke "TpchSf${sf//./_}FromVpce"
     done

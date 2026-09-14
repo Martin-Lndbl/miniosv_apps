@@ -2,7 +2,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # .env stays in the miniosv_ctrl checkout that holds this submodule: direnv,
 # the devshell and the root justfile all read it from there.
-env_file := parent_directory(parent_directory(parent_directory(justfile_directory()))) / ".env"
+common := justfile_directory() / "../../../scripts/bench-setup.sh"
 
 # Object the bench GETs — must match TARGET_PATH in src/config.rs.
 blob := "blob.bin"
@@ -16,19 +16,19 @@ setup:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    env_file="{{ env_file }}"
+    . "{{ common }}"
+    env_file="$BENCH_ENV"
 
-    # Re-running setup keeps the previous answers as defaults.
+    # This recipe *writes* the .env, so it reads whatever is there as defaults
+    # rather than requiring it -- bench_env_load is for the benches that come
+    # after and cannot proceed without one.
     if [ -f "$env_file" ]; then
         set -a
         . "$env_file"
         set +a
     fi
 
-    if ! aws sts get-caller-identity >/dev/null 2>&1; then
-        echo "not logged in to aws — running 'aws login --remote'"
-        aws login --remote
-    fi
+    bench_login
 
     ask() {
         local prompt="$1" default="${2-}" answer=""
@@ -98,21 +98,7 @@ setup:
     # The bench GETs the blob unsigned, so the bucket stays private and the
     # read is granted to the S3 gateway endpoint instead. The instance has to
     # run in a subnet routed through it — that is what 'just deploy' passes.
-    vpce=$(aws ec2 describe-vpc-endpoints \
-        --filters "Name=service-name,Values=com.amazonaws.$region.s3" \
-                  "Name=vpc-endpoint-type,Values=Gateway" \
-        --query "VpcEndpoints[0].VpcEndpointId" --output text 2>/dev/null || true)
-
-    if [ -z "$vpce" ] || [ "$vpce" = "None" ]; then
-        vpc=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" \
-            --query "Vpcs[0].VpcId" --output text)
-        rtb=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc" \
-            --query "RouteTables[?Associations[?Main]].RouteTableId | [0]" --output text)
-        echo "creating an s3 gateway endpoint in $vpc"
-        vpce=$(aws ec2 create-vpc-endpoint --vpc-id "$vpc" \
-            --service-name "com.amazonaws.$region.s3" --route-table-ids "$rtb" \
-            --query "VpcEndpoint.VpcEndpointId" --output text)
-    fi
+    vpce=$(AWS_REGION="$region" bench_vpce --create)
 
     read -r vpc rtbs <<<"$(aws ec2 describe-vpc-endpoints --vpc-endpoint-ids "$vpce" \
         --query "VpcEndpoints[0].[VpcId,join(' ', RouteTableIds)]" --output text)"
@@ -132,9 +118,7 @@ setup:
 
     # Merged by Sid, not written wholesale: this bucket also carries the grant
     # competitors/linux-s3 installs for its binary under bin/.
-    AWS_BUCKET="$bucket" python3 "{{ justfile_directory() }}/../../../scripts/bucket_policy.py" \
-        add --sid BenchBlobFromVpce --vpce "$vpce" \
-        --resource "arn:aws:s3:::$bucket/{{ blob }}"
+    AWS_BUCKET="$bucket" bench_grant BenchBlobFromVpce "arn:aws:s3:::$bucket/{{ blob }}"
 
     # The bench dials the bucket by address because the guest has no DNS.
     # Resolving here keeps that constant tied to the bucket and region actually
@@ -170,8 +154,11 @@ clean *force:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    env_file="{{ env_file }}"
+    . "{{ common }}"
+    env_file="$BENCH_ENV"
 
+    # Lenient for the same reason as setup: clean has to work when the .env is
+    # half-written or already gone.
     if [ -f "$env_file" ]; then
         set -a
         . "$env_file"
