@@ -1,0 +1,7 @@
+[submodule "miniduckdb"]
+	path = miniduckdb
+	url = git@github.com:TUM-DSE/miniduckdb.git
+	branch = perf/minimal
+[submodule "miniduckdb-httpfs"]
+	path = miniduckdb-httpfs
+	url = https://github.com/duckdb/duckdb-httpfs.git
