@@ -42,6 +42,10 @@ const FAULT_ABANDON_CONNS: usize = 0;
 struct WorkerResult {
     bytes_received: AtomicU64,
     elapsed_ns: AtomicU64,
+    /// Wall time this worker spent opening its connections, before the first
+    /// SYN could leave. Reported as the worst worker, not a sum: they run
+    /// concurrently, so a sum is not a duration anything waited.
+    dial_ns: AtomicU64,
     /// Completeness accounting: what this worker's connections were asked to
     /// fetch, and how many finished rather than being abandoned.
     bytes_expected: AtomicU64,
@@ -100,6 +104,11 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
     // it afterwards. `None` for a slot that never opened.
     let mut asked: Vec<Option<(u64, u64)>> = alloc::vec![None; w.slots()];
     let mut expected: u64 = 0;
+    // Wall time of the dial loop. smoltcp holds every SYN until the `poll`
+    // after this loop, so whatever is spent here is time the last connection's
+    // handshake could not have started -- the one number that says whether
+    // opening connections is costing the run anything.
+    let dial_start_ns = w.clock().elapsed_ns();
     for i in 0..open {
         let (start, end) = block_range(first_block + i as u64);
         let mut head = [0u8; 384];
@@ -116,6 +125,7 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
     }
 
     let start_ns = w.clock().elapsed_ns();
+    let dial_ns = start_ns.saturating_sub(dial_start_ns);
     while !w.poll() {}
     let elapsed_ns = w.clock().elapsed_ns().saturating_sub(start_ns);
 
@@ -195,6 +205,7 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
 
     out.bytes_received.store(bytes, Ordering::Relaxed);
     out.elapsed_ns.store(elapsed_ns, Ordering::Relaxed);
+    out.dial_ns.store(dial_ns, Ordering::Relaxed);
     out.bytes_expected.store(expected, Ordering::Relaxed);
     out.conns_total.store(total, Ordering::Relaxed);
     out.conns_clean.store(clean, Ordering::Relaxed);
@@ -282,10 +293,12 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
     let mut bad = 0u64;
     let mut first_bad = 0u64;
     let mut hdr_bad = 0u64;
+    let mut dial_ns_max = 0u64;
 
     for (i, r) in results.iter().enumerate() {
         let b = r.bytes_received.load(Ordering::Relaxed);
         let e = r.elapsed_ns.load(Ordering::Relaxed) as f64 / 1e9;
+        dial_ns_max = dial_ns_max.max(r.dial_ns.load(Ordering::Relaxed));
         total_b += b;
         total_expected += r.bytes_expected.load(Ordering::Relaxed);
         conns_total += r.conns_total.load(Ordering::Relaxed);
@@ -329,7 +342,6 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         "connections   : {}/{} closed cleanly, {} failed",
         conns_clean, conns_total, s.conns_failed
     );
-    println!("syn retries   : {} (expected 0)", s.syn_retries);
     println!(
         "misrouted rx  : {} packets dropped (expected 0)",
         s.misrouted_drops
@@ -382,10 +394,37 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
             println!("  q{}: {} rx pkts, {} errors", q, qi[q], qe[q]);
         }
     }
+    // Two separate questions, which one number used to answer badly. `setup`
+    // is SYN to Established -- the network, one round trip. `dial` is the CPU
+    // spent building a connection before its SYN could go out. The old
+    // "setup" measured from `connect` to Established, so each connection was
+    // charged for the construction of every one behind it in the loop and the
+    // total came out as dial cost times conns^2/2.
     println!(
-        "setup         : {} ms total, {:.1} ms/conn",
-        s.setup_ms_total,
-        s.setup_ms_total as f64 / (conns_total.max(1)) as f64
+        "SETUP STATS   : conns={} failed={} us_avg={} us_p50={} us_p90={} us_max={}{}",
+        s.setup.n,
+        s.conns_failed,
+        s.setup.us_avg,
+        s.setup.us_p50,
+        s.setup.us_p90,
+        s.setup.us_max,
+        // smoltcp does not expose its retransmit count, and its first SYN
+        // retransmit is a second out -- well past any healthy handshake.
+        if s.setup.us_max >= 1_000_000 {
+            " — a SYN was retransmitted"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "DIAL STATS    : dials={} us_avg={} us_p50={} us_p90={} us_max={} loop_ms={:.1}",
+        s.dial.n,
+        s.dial.us_avg,
+        s.dial.us_p50,
+        s.dial.us_p90,
+        s.dial.us_max,
+        // Worst worker, not a sum: this is wall time no SYN could leave in.
+        dial_ns_max as f64 / 1e6
     );
     println!(
         "blocks        : {}/{} of {} MiB requested ({} bytes)",
