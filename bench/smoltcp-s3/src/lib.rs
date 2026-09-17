@@ -42,9 +42,7 @@ const FAULT_ABANDON_CONNS: usize = 0;
 struct WorkerResult {
     bytes_received: AtomicU64,
     elapsed_ns: AtomicU64,
-    /// Wall time this worker spent opening its connections, before the first
-    /// SYN could leave. Reported as the worst worker, not a sum: they run
-    /// concurrently, so a sum is not a duration anything waited.
+    /// Wall time opening connections, before the first SYN could leave.
     dial_ns: AtomicU64,
     /// Completeness accounting: what this worker's connections were asked to
     /// fetch, and how many finished rather than being abandoned.
@@ -104,10 +102,8 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
     // it afterwards. `None` for a slot that never opened.
     let mut asked: Vec<Option<(u64, u64)>> = alloc::vec![None; w.slots()];
     let mut expected: u64 = 0;
-    // Wall time of the dial loop. smoltcp holds every SYN until the `poll`
-    // after this loop, so whatever is spent here is time the last connection's
-    // handshake could not have started -- the one number that says whether
-    // opening connections is costing the run anything.
+    // smoltcp holds every SYN until the `poll` after this loop, so time spent
+    // here is time no handshake could start.
     let dial_start_ns = w.clock().elapsed_ns();
     for i in 0..open {
         let (start, end) = block_range(first_block + i as u64);
@@ -394,12 +390,8 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
             println!("  q{}: {} rx pkts, {} errors", q, qi[q], qe[q]);
         }
     }
-    // Two separate questions, which one number used to answer badly. `setup`
-    // is SYN to Established -- the network, one round trip. `dial` is the CPU
-    // spent building a connection before its SYN could go out. The old
-    // "setup" measured from `connect` to Established, so each connection was
-    // charged for the construction of every one behind it in the loop and the
-    // total came out as dial cost times conns^2/2.
+    // `setup` is SYN to Established (the network); `dial` is the CPU before it.
+    // One number used to conflate them, as dial cost times conns^2/2.
     println!(
         "SETUP STATS   : conns={} failed={} us_avg={} us_p50={} us_p90={} us_max={}{}",
         s.setup.n,
@@ -408,8 +400,7 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         s.setup.us_p50,
         s.setup.us_p90,
         s.setup.us_max,
-        // smoltcp does not expose its retransmit count, and its first SYN
-        // retransmit is a second out -- well past any healthy handshake.
+        // smoltcp exposes no retransmit count; the first one is a second out.
         if s.setup.us_max >= 1_000_000 {
             " — a SYN was retransmitted"
         } else {
@@ -423,7 +414,6 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         s.dial.us_p50,
         s.dial.us_p90,
         s.dial.us_max,
-        // Worst worker, not a sum: this is wall time no SYN could leave in.
         dial_ns_max as f64 / 1e6
     );
     println!(
