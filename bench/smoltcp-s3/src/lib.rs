@@ -18,18 +18,36 @@ extern crate alloc;
 mod config;
 mod selftest;
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use mininet::print::BufWriter;
-use mininet::{println, thread, Config, Endpoint, Request, Stack, Worker, WorkerConfig, WorkerHandle};
+use mininet::{
+    println, thread, BodySink, Config, Endpoint, Stack, Step, Worker, WorkerConfig, WorkerHandle,
+};
 
 use config::{
-    BLOCK_SIZE, CONNS_PER_WORKER, N_WORKERS_REQ, OBJECT_SIZE, PLAIN_HTTP, STUB_TLS_AFTER_HANDSHAKE,
-    TARGET_HOST, TARGET_IP, TARGET_PATH,
+    BLOCK_SIZE, CONNS_PER_WORKER, N_WORKERS_REQ, OBJECT_SIZE, PLAIN_HTTP, TARGET_HOST, TARGET_IP,
+    TARGET_PATH,
 };
+
+/// Counts the plaintext body and drops it. The benchmark measures the stack
+/// up to delivery; what a caller does with the bytes is DuckDB's business.
+#[derive(Default)]
+struct CountSink(u64);
+
+impl BodySink for CountSink {
+    fn write(&mut self, data: &[u8]) {
+        self.0 += data.len() as u64;
+    }
+
+    fn written(&self) -> u64 {
+        self.0
+    }
+}
 
 /// Test knob: abandon this many connections per worker on purpose. A
 /// completeness check that has never been seen to fail is not a check, so
@@ -89,7 +107,7 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
     let mut w = match Worker::new(handle, &cfg) {
         Ok(w) => w,
         Err(e) => {
-            println!("FAIL: q{}: {}", queue_id, e);
+            println!("FAIL: q{}: {:?}", queue_id, e);
             return;
         }
     };
@@ -109,11 +127,7 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
         let (start, end) = block_range(first_block + i as u64);
         let mut head = [0u8; 384];
         let n = build_range_request(&mut head, start, end);
-        let req = Request {
-            head: &head[..n],
-            discard_ciphertext: STUB_TLS_AFTER_HANDSHAKE,
-        };
-        if w.connect(i, &req).is_err() {
+        if w.connect_next(i, &head[..n], Box::new(CountSink::default())).is_err() {
             continue;
         }
         asked[i] = Some((start, end));
@@ -122,7 +136,14 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
 
     let start_ns = w.clock().elapsed_ns();
     let dial_ns = start_ns.saturating_sub(dial_start_ns);
-    while !w.poll() {}
+    // A slot whose connect failed has no connection and nothing to wait for.
+    loop {
+        w.poll();
+        let settled = (0..open).all(|slot| w.conn(slot).map_or(true, |c| c.outcome().is_some()));
+        if settled {
+            break;
+        }
+    }
     let elapsed_ns = w.clock().elapsed_ns().saturating_sub(start_ns);
 
     let mut bytes = 0u64;
@@ -136,24 +157,24 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
             Some(c) => c,
             None => continue,
         };
-        bytes += c.body_bytes();
+        bytes += c.sink_written();
         total += 1;
-        if c.is_complete() {
+        if c.outcome() == Some(Step::Complete) {
             clean += 1;
         } else {
             // A worker that could not finish part of its range never delivered
             // those bytes -- surface it here, not as a silent gap.
             println!(
-                "q{}: conn on port {} did not close cleanly ({} B)",
+                "q{}: slot {} did not finish ({:?}, {} B)",
                 queue_id,
-                c.src_port(),
-                c.body_bytes()
+                slot,
+                c.outcome(),
+                c.sink_written()
             );
         }
-        // The request is ranged, so only 206 is what we asked for. With the
-        // record layer stubbed out there is no plaintext head to read, so
-        // there is no status to judge, and no headers either.
-        if !c.headers_parsed() {
+        // The request is ranged, so only 206 is what we asked for. A status
+        // of 0 means no head was ever parsed, so there is nothing to judge.
+        if c.status() == 0 {
             continue;
         }
         if c.status() != 206 {
@@ -182,10 +203,10 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
                 hdr_bad += 1;
                 if hdr_bad == 1 {
                     println!(
-                        "q{}: head mismatch on port {}: content-length {:?} (want {}), \
+                        "q{}: head mismatch in slot {}: content-length {:?} (want {}), \
                          content-range {:?} (want {}-{}/{}), etag {:?}",
                         queue_id,
-                        c.src_port(),
+                        slot,
                         head.content_length,
                         want,
                         head.content_range,
@@ -215,12 +236,12 @@ pub extern "C" fn osv_app_main() {
     if config::SELFTEST {
         selftest::run();
     }
+    // tls_stub is always false now; the driver still reads the field.
     println!(
-        "bench: {} workers x {} conns x {} MiB block, tls_stub={} scheme={}",
+        "bench: {} workers x {} conns x {} MiB block, tls_stub=false scheme={}",
         N_WORKERS_REQ,
         CONNS_PER_WORKER,
         BLOCK_SIZE / (1024 * 1024),
-        STUB_TLS_AFTER_HANDSHAKE,
         if PLAIN_HTTP { "http" } else { "https" }
     );
 
@@ -230,10 +251,6 @@ pub extern "C" fn osv_app_main() {
         "target: {}.{}.{}.{}:{} {}",
         t[0], t[1], t[2], t[3], peer.port, TARGET_HOST
     );
-    if !peer.is_configured() {
-        println!("FAIL: AWS_TARGET_IP is unset or malformed — run `just setup smoltcp-s3`");
-        exit();
-    }
     if OBJECT_SIZE == 0 || BLOCK_SIZE == 0 || CONNS_PER_WORKER == 0 || N_WORKERS_REQ == 0 {
         println!("FAIL: BENCH_WORKERS, BENCH_CONNS_PER_WORKER, BENCH_BLOCK_SIZE and AWS_BUCKET_SIZE must be nonzero");
         exit();
@@ -244,7 +261,7 @@ pub extern "C" fn osv_app_main() {
     }) {
         Ok(s) => s,
         Err(e) => {
-            println!("FAIL: {}", e);
+            println!("FAIL: {:?}", e);
             exit();
         }
     };
@@ -276,8 +293,6 @@ pub extern "C" fn osv_app_main() {
     let overall_ns = overall_clk.elapsed_ns();
 
     report(&results, n_workers, overall_ns);
-
-    stack.down();
     exit();
 }
 
@@ -360,16 +375,11 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         println!("first bad code: {}", first_bad);
     }
     println!(
-        "response heads: {} did not match the range requested (expected 0){}",
-        hdr_bad,
-        if STUB_TLS_AFTER_HANDSHAKE {
-            " — not checked, the record layer is stubbed out"
-        } else {
-            ""
-        }
+        "response heads: {} did not match the range requested (expected 0)",
+        hdr_bad
     );
     println!(
-        "tx drops      : {} no-mbuf, {} ring-full (expected 0)",
+        "tx            : {} dropped for no mbuf (expected 0), {} held a poll for a full ring",
         s.tx_alloc_fail, s.tx_burst_fail
     );
 
@@ -381,13 +391,6 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         println!("nic tx        : {} pkts, {} oerrors", n.opackets, n.oerrors);
         if n.imissed > 0 || n.rx_nombuf > 0 {
             println!("  ^ the NIC dropped frames before any queue saw them");
-        }
-    }
-    let (mut qi, mut qe) = ([0u64; 32], [0u64; 32]);
-    let nq = mininet::eth_qstats(&mut qi, &mut qe);
-    for q in 0..nq.min(n_workers as usize) {
-        if qe[q] > 0 {
-            println!("  q{}: {} rx pkts, {} errors", q, qi[q], qe[q]);
         }
     }
     // `setup` is SYN to Established (the network); `dial` is the CPU before it.
@@ -424,34 +427,12 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         total_expected
     );
 
-    if STUB_TLS_AFTER_HANDSHAKE {
-        // Ciphertext, so it carries TLS record and HTTP header overhead and
-        // cannot be compared byte-for-byte against the plaintext ranges.
-        let overhead = total_b as f64 - total_expected as f64;
-        println!(
-            "bytes         : {} on the wire (ciphertext, {:+.2}%)",
-            total_b,
-            overhead * 100.0 / (total_expected.max(1)) as f64
-        );
-    } else {
-        println!("bytes         : {} plaintext body", total_b);
-    }
+    println!("bytes         : {} plaintext body", total_b);
 
-    let bytes_ok = if STUB_TLS_AFTER_HANDSHAKE {
-        total_b >= total_expected
-    } else {
-        total_b == total_expected
-    };
+    let bytes_ok = total_b == total_expected;
 
     if ranges_ok && covered && bytes_ok && s.misrouted_drops == 0 && hdr_bad == 0 {
-        if STUB_TLS_AFTER_HANDSHAKE {
-            println!(
-                "COMPLETE: all {} blocks fetched (set BENCH_TLS_STUB=0 for a byte-exact check)",
-                conns_total
-            );
-        } else {
-            println!("COMPLETE: {} bytes, byte-exact", total_b);
-        }
+        println!("COMPLETE: {} bytes, byte-exact", total_b);
     } else {
         println!(
             "INCOMPLETE: {} connections abandoned, {} blocks unrequested, {} bytes {}",

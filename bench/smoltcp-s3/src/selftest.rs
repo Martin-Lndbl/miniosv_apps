@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use mininet::print::BufWriter;
 use mininet::{println, thread, Config, Endpoint, Error, Service, ServiceConfig, Stack};
 
-use crate::config::{PLAIN_HTTP, STUB_TLS_AFTER_HANDSHAKE, TARGET_HOST, TARGET_IP, TARGET_PATH};
+use crate::config::{PLAIN_HTTP, TARGET_HOST, TARGET_IP, TARGET_PATH};
 
 const K: usize = 1024;
 
@@ -40,7 +40,7 @@ fn range_request(buf: &mut [u8], start: u64, end: u64) -> usize {
 fn get(svc: &Service, start: u64, end: u64, buf: &mut [u8]) -> Result<u64, Error> {
     let mut head = [0u8; 384];
     let n = range_request(&mut head, start, end);
-    let r = svc.get_with(&head[..n], buf, STUB_TLS_AFTER_HANDSHAKE)?;
+    let r = svc.get(&head[..n], buf)?;
     let want = end - start + 1;
     if r.status != 206 {
         println!("  status {} (want 206)", r.status);
@@ -75,7 +75,7 @@ pub fn run() -> ! {
     let stack = match Stack::up(&Config { queues: 4 }) {
         Ok(s) => s,
         Err(e) => {
-            println!("FAIL: stack: {}", e);
+            println!("FAIL: stack: {:?}", e);
             halt();
         }
     };
@@ -88,7 +88,7 @@ pub fn run() -> ! {
     let svc = match Service::start(&stack, &cfg) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            println!("FAIL: service: {}", e);
+            println!("FAIL: service: {:?}", e);
             halt();
         }
     };
@@ -130,7 +130,7 @@ pub fn run() -> ! {
         {
             let mut head = [0u8; 384];
             let n = range_request(&mut head, 0, 64 * K as u64 - 1);
-            svc.get_with(&head[..n], &mut small, STUB_TLS_AFTER_HANDSHAKE)
+            svc.get(&head[..n], &mut small)
         },
         Err(Error::BufferTooSmall)
     );

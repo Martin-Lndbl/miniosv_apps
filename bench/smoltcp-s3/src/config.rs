@@ -158,12 +158,14 @@ const _: () = assert!(
     "BENCH_SCHEME must be http or https"
 );
 
-/// Discard ciphertext after the handshake instead of decrypting it. Isolates
-/// the network stack from the record layer; the transfer is then unverifiable
-/// byte-for-byte, so the completeness check falls back to a range check.
-/// Meaningless without a record layer, so `PLAIN_HTTP` forces it off.
-pub const STUB_TLS_AFTER_HANDSHAKE: bool =
-    parse_bool(option_env!("BENCH_TLS_STUB"), false) && !PLAIN_HTTP;
+/// `BENCH_TLS_STUB=1` used to discard ciphertext after the handshake. The
+/// stack no longer has that mode (removed with the 2026-09-18 trim: nothing
+/// but this diagnostic ever ran it), so asking for it is a build error rather
+/// than a row labelled tls_stub=false that measured something else.
+const _: () = assert!(
+    !parse_bool(option_env!("BENCH_TLS_STUB"), false),
+    "BENCH_TLS_STUB=1 is no longer supported: mininet always decrypts"
+);
 
 /// Resolved by `just setup` from the bucket endpoint and baked in. The guest
 /// has no resolver by design, so this has to be decided at build time; if it
