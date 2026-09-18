@@ -167,6 +167,9 @@ setup with_blob="1":
         printf 'AWS_BUCKET="%s"\n' "$bucket"
         printf 'AWS_SUBNET="%s"\n' "$subnet"
         printf 'AWS_TARGET_IP="%s"\n' "$target_ip"
+        # Kept, never asked: the credentials profile the benches run with. An
+        # IAM user's access keys here outlive any `aws login` session.
+        printf 'AWS_PROFILE="%s"\n' "${AWS_PROFILE:-}"
         printf 'BENCH_WORKERS="%s"\n' "$workers"
         printf 'BENCH_CONNS_PER_WORKER="%s"\n' "$conns"
         printf 'BENCH_TLS_STUB="%s"\n' "$tls_stub"
