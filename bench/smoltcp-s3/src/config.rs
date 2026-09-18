@@ -146,6 +146,20 @@ pub const OBJECT_SIZE: u64 = parse_size(option_env!("AWS_BUCKET_SIZE"), 10 * 102
 /// shrank each request as parallelism rose and confounded the two.
 pub const BLOCK_SIZE: u64 = parse_size(option_env!("BENCH_BLOCK_SIZE"), 64 * 1024 * 1024);
 
+/// RX descriptors per queue asked of the device; 0 leaves mininet's default
+/// (4096). Frames the NIC cannot land between two polls are `imissed`.
+pub const RX_DESC: u16 = parse_size(option_env!("BENCH_RX_DESC"), 0) as u16;
+
+/// Blocks each worker fetches. Its connections take the next one as they
+/// finish, so the run is not bounded by its slowest connection once this
+/// exceeds the connection count. 0 means one block per connection, the
+/// original design, where the two are the same number.
+pub const BLOCKS_PER_WORKER: u64 = parse_size(option_env!("BENCH_BLOCKS_PER_WORKER"), 0);
+
+/// A connection whose SYN is unanswered this long is dropped and dialled
+/// again on a fresh port; smoltcp would wait a full second. 0 disables.
+pub const SYN_REDIAL_MS: u64 = parse_size(option_env!("BENCH_SYN_REDIAL_MS"), 0);
+
 /// `BENCH_SCHEME=http` drops TLS entirely and dials port 80, which isolates
 /// the network stack from the record layer. Rows from the two schemes measure
 /// different things and do not belong in one CSV.

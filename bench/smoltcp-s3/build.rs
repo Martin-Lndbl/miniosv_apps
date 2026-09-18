@@ -13,6 +13,9 @@ fn main() {
         "BENCH_SCHEME",
         "BENCH_BLOCK_SIZE",
         "BENCH_MODE",
+        "BENCH_RX_DESC",
+        "BENCH_BLOCKS_PER_WORKER",
+        "BENCH_SYN_REDIAL_MS",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }

@@ -72,7 +72,7 @@ pub fn run() -> ! {
     println!("mininet selftest: Service, parking handoff, BufferSink");
 
     let peer = Endpoint::new(TARGET_IP, TARGET_HOST, !PLAIN_HTTP);
-    let stack = match Stack::up(&Config { queues: 4 }) {
+    let stack = match Stack::up(&Config { queues: 4, rx_desc: 0 }) {
         Ok(s) => s,
         Err(e) => {
             println!("FAIL: stack: {:?}", e);

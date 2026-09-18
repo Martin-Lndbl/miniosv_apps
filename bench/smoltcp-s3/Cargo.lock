@@ -98,6 +98,7 @@ name = "osv_app"
 version = "0.1.0"
 dependencies = [
  "mininet",
+ "spin",
 ]
 
 [[package]]
@@ -166,6 +167,12 @@ dependencies = [
  "heapless",
  "managed",
 ]
+
+[[package]]
+name = "spin"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "stable_deref_trait"

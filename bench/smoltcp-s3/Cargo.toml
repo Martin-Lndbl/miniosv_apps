@@ -16,5 +16,8 @@ panic = "abort"
 # that is where the kernel's build can reach it -- DuckDB links the same crate.
 # Both are submodules of miniosv_ctrl and are always checked out side by side,
 # which is the same assumption the justfile here already makes about .env.
+[dependencies]
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
+
 [dependencies.mininet]
 path = "../../../miniosv/modules/mininet/rust"
