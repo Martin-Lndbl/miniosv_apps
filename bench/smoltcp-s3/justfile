@@ -100,6 +100,11 @@ setup with_blob="1":
     elif ! aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
         echo "s3://$bucket is not reachable — answer 'create' to make a new one" >&2
         exit 1
+    else
+        # An existing bucket has to be in the region everything else will be
+        # in; the instances, the endpoint and the bench's address all follow
+        # $region from here on.
+        AWS_BUCKET="$bucket" AWS_REGION="$region" bench_region_check
     fi
 
     # The blob is checked every run: an existing bucket may have lost it, or
