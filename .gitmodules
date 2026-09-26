@@ -4,4 +4,5 @@
 	branch = perf/minimal
 [submodule "miniduckdb-httpfs"]
 	path = miniduckdb-httpfs
-	url = https://github.com/duckdb/duckdb-httpfs.git
+	url = git@github.com:Martin-Lndbl/duckdb-httpfs.git
+	branch = anyblob
