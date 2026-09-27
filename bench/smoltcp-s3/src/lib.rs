@@ -338,6 +338,7 @@ pub extern "C" fn osv_app_main() {
     let stack = match Stack::up(&Config {
         queues: N_WORKERS_REQ,
         rx_desc: RX_DESC,
+        peer: Some(TARGET_IP),
     }) {
         Ok(s) => s,
         Err(e) => {
