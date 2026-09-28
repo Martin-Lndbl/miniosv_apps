@@ -201,6 +201,7 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
                 {
                     // Same range, fresh port: the range was already counted.
                     redials += 1;
+                    w.dial_failed();
                     w.release(slot);
                     let (s0, e0) = asked[slot].expect("a dialled slot has a range");
                     let mut head = [0u8; 384];
@@ -273,6 +274,9 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
             }
             w.release(slot);
             asked[slot] = None;
+            if matches!(step, Step::Failed(mininet::Error::SynTimeout)) {
+                w.dial_failed();
+            }
             if next_block < blocks {
                 let block = first_block + next_block;
                 next_block += 1;
@@ -292,7 +296,9 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
         }
     }
     let end_ns = w.clock().elapsed_ns();
+    out.resolved.store(u32::from_be_bytes(w.peer_ip()) as u64, Ordering::Relaxed); // where it ended up
     let elapsed_ns = end_ns.saturating_sub(start_ns);
+    println!("q{}: done after {:.1} s", queue_id, elapsed_ns as f64 / 1e9);
     let tail_ns = end_ns.saturating_sub(first_idle_ns.unwrap_or(end_ns));
     let epoch = w.clock().epoch_ns();
     out.full_abs_ns.store(epoch + start_ns, Ordering::Relaxed);
@@ -376,11 +382,16 @@ pub extern "C" fn osv_app_main() {
             move || {
                 let clk = mininet::MonoClock::new();
                 let mut next = 0u64;
+                let mut next_report = 10_000_000_000u64;
                 while sampling.load(Ordering::Relaxed) {
                     let t = clk.elapsed_ns();
                     if t >= next {
                         if let Some(n) = mininet::eth_stats() {
                             samples.lock().push((clk.epoch_ns() + t, n.ibytes));
+                            if t >= next_report {
+                                println!("progress: {} s, {:.1} GiB in", t / 1_000_000_000, n.ibytes as f64 / (1u64 << 30) as f64);
+                                next_report = t + 10_000_000_000;
+                            }
                         }
                         next = t + 10_000_000;
                     }
