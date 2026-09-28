@@ -336,11 +336,11 @@ pub extern "C" fn osv_app_main() {
 
     let peer = Endpoint::new(TARGET_IP, TARGET_HOST, !PLAIN_HTTP);
     let t = peer.ip;
-    println!(
-        "target: {}.{}.{}.{}:{} {}{}",
-        t[0], t[1], t[2], t[3], peer.port, TARGET_HOST,
-        if RESOLVE { " (resolved at boot, its addresses shared out)" } else { "" }
-    );
+    if RESOLVE {
+        println!("target: {}:{} (resolved at boot, refreshed every minute)", TARGET_HOST, peer.port);
+    } else {
+        println!("target: {}.{}.{}.{}:{} {}", t[0], t[1], t[2], t[3], peer.port, TARGET_HOST);
+    }
     // BENCH_WORKERS=0 is legal: every queue of every NIC.
     if OBJECT_SIZE == 0 || BLOCK_SIZE == 0 || CONNS_PER_WORKER == 0 {
         println!("FAIL: BENCH_CONNS_PER_WORKER, BENCH_BLOCK_SIZE and AWS_BUCKET_SIZE must be nonzero");
@@ -350,7 +350,7 @@ pub extern "C" fn osv_app_main() {
     let stack = match Stack::up(&Config {
         queues: N_WORKERS_REQ,
         rx_desc: RX_DESC,
-        peer: Some(TARGET_IP),
+        peer: (!RESOLVE).then_some(TARGET_IP),
         resolve: RESOLVE.then_some(TARGET_HOST),
     }) {
         Ok(s) => s,

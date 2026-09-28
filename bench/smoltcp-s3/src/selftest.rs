@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use mininet::print::BufWriter;
 use mininet::{println, thread, Config, Endpoint, Error, Service, ServiceConfig, Stack};
 
-use crate::config::{PLAIN_HTTP, TARGET_HOST, TARGET_IP, TARGET_PATH};
+use crate::config::{PLAIN_HTTP, RESOLVE, TARGET_HOST, TARGET_IP, TARGET_PATH};
 
 const K: usize = 1024;
 
@@ -72,7 +72,7 @@ pub fn run() -> ! {
     println!("mininet selftest: Service, parking handoff, BufferSink");
 
     let peer = Endpoint::new(TARGET_IP, TARGET_HOST, !PLAIN_HTTP);
-    let stack = match Stack::up(&Config { queues: 4, rx_desc: 0, peer: Some(TARGET_IP), resolve: None }) {
+    let stack = match Stack::up(&Config { queues: 4, rx_desc: 0, peer: (!RESOLVE).then_some(TARGET_IP), resolve: RESOLVE.then_some(TARGET_HOST) }) {
         Ok(s) => s,
         Err(e) => {
             println!("FAIL: stack: {:?}", e);
