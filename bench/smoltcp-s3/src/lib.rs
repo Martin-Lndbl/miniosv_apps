@@ -32,7 +32,7 @@ use mininet::{
 
 use config::{
     BLOCKS_PER_WORKER, BLOCK_SIZE, CONNS_PER_WORKER, N_WORKERS_REQ, OBJECT_SIZE, PLAIN_HTTP, RX_DESC,
-    SYN_REDIAL_MS, TARGET_HOST, TARGET_IP, TARGET_PATH,
+    RESOLVE, SYN_REDIAL_MS, TARGET_HOST, TARGET_IP, TARGET_PATH,
 };
 
 /// Counts the plaintext body and drops it. The benchmark measures the stack
@@ -83,6 +83,8 @@ struct WorkerResult {
     /// Responses whose parsed head did not describe the range that was asked
     /// for. Validates the header parser against what S3 actually sends.
     hdr_bad: AtomicU64,
+    /// The address this worker dialled, as a big-endian u32.
+    resolved: AtomicU64,
 }
 
 fn build_range_request(buf: &mut [u8], start: u64, end_inclusive: u64) -> usize {
@@ -131,6 +133,7 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
 
     let mut cfg = WorkerConfig::new(peer);
     cfg.conns = CONNS_PER_WORKER;
+    cfg.resolve = RESOLVE;
     let mut w = match Worker::new(handle, &cfg) {
         Ok(w) => w,
         Err(e) => {
@@ -138,6 +141,7 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
             return;
         }
     };
+    out.resolved.store(u32::from_be_bytes(w.peer_ip()) as u64, Ordering::Relaxed);
 
     let slots = w.slots();
     // Fault injection leaves the last few blocks unrequested -- exactly the
@@ -327,8 +331,9 @@ pub extern "C" fn osv_app_main() {
     let peer = Endpoint::new(TARGET_IP, TARGET_HOST, !PLAIN_HTTP);
     let t = peer.ip;
     println!(
-        "target: {}.{}.{}.{}:{} {}",
-        t[0], t[1], t[2], t[3], peer.port, TARGET_HOST
+        "target: {}.{}.{}.{}:{} {}{}",
+        t[0], t[1], t[2], t[3], peer.port, TARGET_HOST,
+        if RESOLVE { " (resolved at boot, its addresses shared out)" } else { "" }
     );
     // BENCH_WORKERS=0 is legal: every queue of every NIC.
     if OBJECT_SIZE == 0 || BLOCK_SIZE == 0 || CONNS_PER_WORKER == 0 {
@@ -340,6 +345,7 @@ pub extern "C" fn osv_app_main() {
         queues: N_WORKERS_REQ,
         rx_desc: RX_DESC,
         peer: Some(TARGET_IP),
+        resolve: RESOLVE.then_some(TARGET_HOST),
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -486,6 +492,19 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
     let s = mininet::stats::snapshot();
 
     println!();
+    if RESOLVE {
+        let mut fronts: Vec<u32> = results.iter().map(|r| r.resolved.load(Ordering::Relaxed) as u32).collect();
+        fronts.sort_unstable();
+        fronts.dedup();
+        let names: Vec<alloc::string::String> = fronts
+            .iter()
+            .map(|v| {
+                let o = v.to_be_bytes();
+                alloc::format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
+            })
+            .collect();
+        println!("resolved      : {} front-end(s): {}", fronts.len(), names.join(", "));
+    }
     println!(
         "connections   : {}/{} closed cleanly, {} failed",
         conns_clean, conns_total, s.conns_failed

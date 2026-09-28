@@ -181,15 +181,18 @@ const _: () = assert!(
     "BENCH_TLS_STUB=1 is no longer supported: mininet always decrypts"
 );
 
-/// Resolved by `just setup` from the bucket endpoint and baked in. The guest
-/// has no resolver by design, so this has to be decided at build time; if it
-/// goes stale the run fails loudly with a SYN timeout rather than silently.
+/// Resolved by `just setup` from the bucket endpoint and baked in: the address
+/// dialled, or with RESOLVE only the boot-time next-hop hint.
 pub const TARGET_IP: [u8; 4] = parse_ipv4(option_env!("AWS_TARGET_IP"));
 
 const _: () = assert!(
     !(TARGET_IP[0] == 0 && TARGET_IP[1] == 0 && TARGET_IP[2] == 0 && TARGET_IP[3] == 0),
     "AWS_TARGET_IP is unset or malformed - run `just setup smoltcp-s3`"
 );
+
+/// `BENCH_RESOLVE=1`: resolve TARGET_HOST at boot and spread the workers over
+/// its front-ends. Off by default: the comparisons pin one front-end on purpose.
+pub const RESOLVE: bool = parse_bool(option_env!("BENCH_RESOLVE"), false);
 
 /// Endpoint, from $AWS_BUCKET / $AWS_REGION.
 pub const TARGET_HOST: &str = concat!(
