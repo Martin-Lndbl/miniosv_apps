@@ -330,8 +330,9 @@ pub extern "C" fn osv_app_main() {
         "target: {}.{}.{}.{}:{} {}",
         t[0], t[1], t[2], t[3], peer.port, TARGET_HOST
     );
-    if OBJECT_SIZE == 0 || BLOCK_SIZE == 0 || CONNS_PER_WORKER == 0 || N_WORKERS_REQ == 0 {
-        println!("FAIL: BENCH_WORKERS, BENCH_CONNS_PER_WORKER, BENCH_BLOCK_SIZE and AWS_BUCKET_SIZE must be nonzero");
+    // BENCH_WORKERS=0 is legal: every queue of every NIC.
+    if OBJECT_SIZE == 0 || BLOCK_SIZE == 0 || CONNS_PER_WORKER == 0 {
+        println!("FAIL: BENCH_CONNS_PER_WORKER, BENCH_BLOCK_SIZE and AWS_BUCKET_SIZE must be nonzero");
         exit();
     }
 
