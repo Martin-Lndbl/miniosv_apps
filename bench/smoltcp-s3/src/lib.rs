@@ -119,6 +119,23 @@ fn block_range(block: u64) -> (u64, u64) {
     (start, start + BLOCK_SIZE - 1)
 }
 
+/// Blocks handed out so far. Workers draw from one pool instead of owning a
+/// fixed slice of the object, so a worker that is slower -- because its
+/// front-end will not serve jumbo, or for any other reason -- simply fetches
+/// fewer blocks rather than holding the whole run open while the others idle.
+/// One relaxed fetch_add per block, and a block is 128 MiB.
+static NEXT_BLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// The next unclaimed block, or None once the pool is empty.
+fn claim_block(total: u64) -> Option<u64> {
+    let b = NEXT_BLOCK.fetch_add(1, Ordering::Relaxed);
+    if b < total {
+        Some(b)
+    } else {
+        None
+    }
+}
+
 /// Blocks a worker owns: `BLOCKS_PER_WORKER`, or one per connection.
 fn blocks_per_worker() -> u64 {
     if BLOCKS_PER_WORKER == 0 {
@@ -138,7 +155,7 @@ fn dial(w: &mut Worker, slot: usize, block: u64) -> bool {
 }
 
 /// One worker: keep every slot on a block until its blocks are gone.
-fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<WorkerResult>) {
+fn run_worker(handle: WorkerHandle, peer: Endpoint, total_blocks: u64, out: Arc<WorkerResult>) {
     let queue_id = handle.queue_id();
 
     let mut cfg = WorkerConfig::new(peer);
@@ -154,10 +171,6 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
     out.resolved.store(u32::from_be_bytes(w.peer_ip()) as u64, Ordering::Relaxed);
 
     let slots = w.slots();
-    // Fault injection leaves the last few blocks unrequested -- exactly the
-    // failure the completeness check has to catch.
-    let blocks = blocks_per_worker().saturating_sub(FAULT_ABANDON_CONNS as u64);
-    let mut next_block: u64 = 0;
     // What each slot is fetching, and when it dialled, for the head check
     // and the SYN re-dial.
     let mut asked: Vec<Option<(u64, u64)>> = alloc::vec![None; slots];
@@ -176,11 +189,9 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
     // here is time no handshake could start.
     let dial_start_ns = w.clock().elapsed_ns();
     for slot in 0..slots {
-        if next_block >= blocks {
+        let Some(block) = claim_block(total_blocks) else {
             break;
-        }
-        let block = first_block + next_block;
-        next_block += 1;
+        };
         if dial(&mut w, slot, block) {
             let (start, end) = block_range(block);
             asked[slot] = Some((start, end));
@@ -295,9 +306,7 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
             if matches!(step, Step::Failed(mininet::Error::SynTimeout)) {
                 w.dial_failed();
             }
-            if next_block < blocks {
-                let block = first_block + next_block;
-                next_block += 1;
+            if let Some(block) = claim_block(total_blocks) {
                 if dial(&mut w, slot, block) {
                     let (start, end) = block_range(block);
                     asked[slot] = Some((start, end));
@@ -422,14 +431,17 @@ pub extern "C" fn osv_app_main() {
             cpu,
         )
     };
+    // The whole object, drawn from one pool. Fault injection still leaves the
+    // last few unrequested, which is the case the completeness check catches.
+    let total_blocks = (n_workers as u64)
+        * blocks_per_worker().saturating_sub(FAULT_ABANDON_CONNS as u64);
     let threads: Vec<_> = (0..n_workers)
         .map(|i| {
             let handle = stack.handle(i).expect("queue granted by the device");
             let peer = peer.clone();
             let out = results[i as usize].clone();
-            let first_block = (i as u64) * blocks_per_worker();
             thread::spawn(
-                move || run_worker(handle, peer, first_block, out),
+                move || run_worker(handle, peer, total_blocks, out),
                 Some(i as usize),
             )
         })
