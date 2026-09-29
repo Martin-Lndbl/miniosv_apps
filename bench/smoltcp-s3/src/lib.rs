@@ -85,6 +85,16 @@ struct WorkerResult {
     hdr_bad: AtomicU64,
     /// The address this worker dialled, as a big-endian u32.
     resolved: AtomicU64,
+    /// Time actually spent inside poll doing work, summed over the loop. The
+    /// busy-poll cpu_s figure is workers x wall by construction, so it cannot
+    /// show a per-byte saving; this can, because fewer frames is less work
+    /// even when the line rate is the limit.
+    work_ns: AtomicU64,
+    /// Of that, the polls smoltcp reported as having changed socket state --
+    /// work done rather than an empty spin, so this is the part that should
+    /// scale with the number of frames.
+    active_ns: AtomicU64,
+    poll_iters: AtomicU64,
 }
 
 fn build_range_request(buf: &mut [u8], start: u64, end_inclusive: u64) -> usize {
@@ -184,8 +194,16 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
     // From the first slot that found no block left to the end: time this
     // worker ran below its concurrency.
     let mut first_idle_ns: Option<u64> = None;
+    let mut work_ns = 0u64;
+    let mut active_ns = 0u64;
+    let mut poll_iters = 0u64;
     loop {
         w.poll();
+        work_ns += w.last_busy_ns();
+        if w.last_active() {
+            active_ns += w.last_busy_ns();
+        }
+        poll_iters += 1;
         let now_ns = w.clock().elapsed_ns();
         let mut busy = false;
         for slot in 0..slots {
@@ -304,6 +322,9 @@ fn run_worker(handle: WorkerHandle, peer: Endpoint, first_block: u64, out: Arc<W
     out.full_abs_ns.store(epoch + start_ns, Ordering::Relaxed);
     out.idle_abs_ns.store(epoch + first_idle_ns.unwrap_or(end_ns), Ordering::Relaxed);
 
+    out.work_ns.store(work_ns, Ordering::Relaxed);
+    out.active_ns.store(active_ns, Ordering::Relaxed);
+    out.poll_iters.store(poll_iters, Ordering::Relaxed);
     out.bytes_received.store(bytes, Ordering::Relaxed);
     out.elapsed_ns.store(elapsed_ns, Ordering::Relaxed);
     out.dial_ns.store(dial_ns, Ordering::Relaxed);
@@ -437,6 +458,9 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
     let mut tail_ns_max = 0u64;
     let mut tail_ns_sum = 0u64;
     let mut redials = 0u64;
+    let mut work_ns_total = 0u64;
+    let mut active_ns_total = 0u64;
+    let mut poll_iters_total = 0u64;
     // Each worker's rate while every slot of it was busy, summed: what the
     // stack sustains, as opposed to what the slowest connection leaves of it.
     let mut steady_bps = 0f64;
@@ -449,6 +473,9 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         tail_ns_max = tail_ns_max.max(tail);
         tail_ns_sum += tail;
         redials += r.redials.load(Ordering::Relaxed);
+        work_ns_total += r.work_ns.load(Ordering::Relaxed);
+        active_ns_total += r.active_ns.load(Ordering::Relaxed);
+        poll_iters_total += r.poll_iters.load(Ordering::Relaxed);
         let busy_s = (r.elapsed_ns.load(Ordering::Relaxed).saturating_sub(tail)) as f64 / 1e9;
         steady_bps += b as f64 * 8.0 / busy_s.max(1e-9);
         total_b += b;
@@ -530,6 +557,26 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         );
     }
 
+    // Measured, where cpu_s above is assumed: the time the workers were really
+    // inside poll doing something. Per byte this is what a frame-size change
+    // moves, and it moves even when the line rate is what caps throughput --
+    // which is the only way to price jumbo on a burstable instance.
+    if total_b > 0 {
+        println!(
+            "WORK: {:.3} s inside poll over {} iters, {:.1}% of {:.1} worker-s, {:.1} ns/KiB",
+            work_ns_total as f64 / 1e9,
+            poll_iters_total,
+            100.0 * work_ns_total as f64 / (n_workers as f64 * overall_s * 1e9).max(1e-9),
+            n_workers as f64 * overall_s,
+            work_ns_total as f64 / (total_b as f64 / 1024.0)
+        );
+        println!(
+            "WORK ACTIVE: {:.3} s in polls that moved a socket, {:.1} ns/KiB",
+            active_ns_total as f64 / 1e9,
+            active_ns_total as f64 / (total_b as f64 / 1024.0)
+        );
+    }
+
     println!(
         "STEADY: {:.3} Gbps of payload at full concurrency (tails excluded)",
         steady_bps / 1e9
@@ -605,6 +652,30 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
             "nic rx        : {} pkts, {} imissed, {} ierrors, {} nombuf",
             n.ipackets, n.imissed, n.ierrors, n.rx_nombuf
         );
+        // The jumbo question in one number, measured rather than assumed: the
+        // NIC's own byte and frame counts. At MTU 1500 no frame can exceed
+        // 1514, so any average above that is jumbo actually arriving.
+        if n.ipackets > 0 {
+            let avg = |b: u64, p: u64| if p > 0 { b as f64 / p as f64 } else { 0.0 };
+            println!(
+                "nic rx frame  : {:.1} B avg ({} bytes / {} pkts)",
+                avg(n.ibytes, n.ipackets),
+                n.ibytes,
+                n.ipackets
+            );
+            // Averaging the two populations hides the answer. Split them: at a
+            // 1500-byte MTU nothing over 1514 can exist, so the first count is
+            // proof, and the second says how much never went jumbo at all.
+            println!(
+                "  over 1514   : {} pkts, {:.0} B avg | 1500-sized: {} pkts, {:.0} B avg | largest {}",
+                s.rx_jumbo_pkts,
+                avg(s.rx_jumbo_bytes, s.rx_jumbo_pkts),
+                n.ipackets.saturating_sub(s.rx_jumbo_pkts),
+                avg(n.ibytes.saturating_sub(s.rx_jumbo_bytes),
+                    n.ipackets.saturating_sub(s.rx_jumbo_pkts)),
+                s.rx_len_max
+            );
+        }
         println!("nic tx        : {} pkts, {} oerrors", n.opackets, n.oerrors);
         if n.imissed > 0 || n.rx_nombuf > 0 {
             println!("  ^ the NIC dropped frames before any queue saw them");
