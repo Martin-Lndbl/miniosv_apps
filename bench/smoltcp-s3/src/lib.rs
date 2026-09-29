@@ -480,6 +480,56 @@ fn report(results: &[Arc<WorkerResult>], n_workers: u16, overall_ns: u64) {
         total_b as f64 * 8.0 / 1e9 / overall_s.max(1e-9)
     );
 
+    // The one figure both arms define identically: competitors/linux-s3
+    // prints it with the same formula, payload over the run with connection
+    // setup taken off and the straggler drain left in. AGGREGATE cannot
+    // serve as the shared metric -- its tail scales with the connection
+    // count, which scales with the worker count, so it penalises exactly the
+    // points a worker sweep is looking for. STEADY cannot either: it sums
+    // per-worker rates over windows that do not coincide, so it is an upper
+    // bound no instant achieved. WIRE STEADY is properly measured but counts
+    // frame bytes, and in a comparison whose variable is frame size that
+    // credits the small-frame side with its own header overhead.
+    // SYN-to-Established of the slowest connection -- `dial` is only the cpu
+    // cost of submitting a non-blocking connect and reads as 0 us, so it is
+    // not the analogue of Linux's max(handshake_ns). The distinction barely
+    // matters here (1.4 ms of an 8 s run) because mininet brings up 512
+    // connections concurrently in about a millisecond, where the kernel takes
+    // seconds -- which is itself why AGGREGATE and TRANSFER sit on top of
+    // each other on this arm and far apart on the other.
+    let setup_s = mininet::stats::snapshot().setup.us_max as f64 / 1e6;
+    let transfer_s = (overall_s - setup_s).max(1e-9);
+    println!(
+        "TRANSFER: {:.1} MiB in {:.3} s => {:.1} MB/s, {:.3} Gbps (setup {:.3} s excluded)",
+        total_b as f64 / (1024.0 * 1024.0),
+        transfer_s,
+        total_b as f64 / 1e6 / transfer_s,
+        total_b as f64 * 8.0 / 1e9 / transfer_s,
+        setup_s
+    );
+
+    // What the throughput cost. A pinned worker busy-polls, so it holds its
+    // cpu for the whole run whether or not a frame is there: cpu_s is
+    // workers x wall, and that is what was paid for. Linux reports the same
+    // quantity from /proc/stat, measured rather than assumed, so Gbps per
+    // cpu-second compares across the arms without arguing about what "equal
+    // resources" means.
+    //
+    // No utilisation figure here: this bench drives w.poll() in its own loop
+    // rather than through service.rs, so stats::PollAcc never accumulates and
+    // poll_work_ns is always 0 -- printing it would read as "the pollers did
+    // nothing".
+    {
+        let cpu_s = n_workers as f64 * overall_s;
+        println!(
+            "CPU: workers={} elapsed={:.3} s cpu_s={:.1} gbps_per_cpu_s={:.2}",
+            n_workers,
+            overall_s,
+            cpu_s,
+            if cpu_s > 0.0 { total_b as f64 * 8.0 / 1e9 / cpu_s } else { 0.0 }
+        );
+    }
+
     println!(
         "STEADY: {:.3} Gbps of payload at full concurrency (tails excluded)",
         steady_bps / 1e9
